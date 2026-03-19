@@ -1952,7 +1952,7 @@ with tab6:
             plo(fig_fv)
             fv1,fv2,fv3=st.columns(3)
             with fv1: card("Fair Value (mediana)",f"${fv_med:.2f}",GREEN)
-            with fv2: card("Prezzo attuale",f"${price:.2f}",ACCENT)
+            with fv2: card("Prezzo attuale", f"${price:.2f}" if price else "N/A", ACCENT)
             with fv3:
                 label_d="PREMIUM" if premium_disc>0 else "SCONTO"
                 card(label_d,f"{abs(premium_disc)*100:.1f}%",RED if premium_disc>0 else GREEN)
@@ -2383,7 +2383,7 @@ with tab9:
                 ],
                 "threshold": {"line": {"color": "white", "width": 3}, "value": 0},
             },
-            title={"text": f"Upside/Downside vs ${price:.2f}<br><b>{_v_label}</b>",
+            title={"text": f"Upside/Downside vs {'$'+f'{price:.2f}' if price else 'N/A'}<br><b>{_v_label}</b>",
                    "font": {"color": TEXT_C, "size": 14}},
         ))
         fig_gauge.update_layout(**LAYOUT, height=380)
