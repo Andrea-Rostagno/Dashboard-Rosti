@@ -349,22 +349,59 @@ def get_market_data(ticker, fmp_key):
                     "netProfitMarginTTM":r.get("netProfitMarginTTM"),
                 })
         except Exception: pass
+    # ── Fallback 1: yfinance fast_info (leggero, funziona su Cloud) ─────────
     if not result.get("currentPrice"):
+        try:
+            tk  = yf.Ticker(ticker)
+            fi  = tk.fast_info
+            result.setdefault("currentPrice",      fi.get("lastPrice") or fi.get("regularMarketPrice"))
+            result.setdefault("marketCap",         fi.get("marketCap"))
+            result.setdefault("sharesOutstanding", fi.get("shares"))
+        except Exception: pass
+
+    # ── Fallback 2: yf.download per il prezzo (funziona anche quando .info è bloccato) ──
+    if not result.get("currentPrice"):
+        try:
+            _hist = yf.download(ticker, period="5d", interval="1d",
+                                auto_adjust=True, progress=False)
+            if not _hist.empty:
+                _close = _hist["Close"]
+                if isinstance(_close, pd.DataFrame): _close = _close.iloc[:, 0]
+                result["currentPrice"] = float(_close.dropna().iloc[-1])
+        except Exception: pass
+
+    # ── Fallback 3: yf.info completo (più lento, a volte bloccato su Cloud) ─
+    if not result.get("sector") or not result.get("currentPrice"):
         try:
             info = yf.Ticker(ticker).info
             if info and len(info) > 5:
                 result.setdefault("marketCap",        info.get("marketCap"))
                 result.setdefault("currentPrice",     info.get("currentPrice") or info.get("regularMarketPrice"))
                 result.setdefault("sharesOutstanding",info.get("sharesOutstanding"))
-                result.setdefault("beta",             info.get("beta",1.0))
+                result.setdefault("beta",             info.get("beta", 1.0))
                 result.setdefault("sector",           info.get("sector","N/A"))
                 result.setdefault("industry",         info.get("industry","N/A"))
-                result.setdefault("shortName",        info.get("shortName",ticker))
+                result.setdefault("shortName",        info.get("shortName", ticker))
                 result.setdefault("trailingPE",       info.get("trailingPE"))
                 result.setdefault("priceToSalesTrailing12Months",
                                   info.get("priceToSalesTrailing12Months"))
                 result.setdefault("description",      info.get("longBusinessSummary",""))
         except Exception: pass
+
+    # ── Fallback 4: Yahoo Finance API diretta (senza yfinance) ──────────────
+    if not result.get("currentPrice"):
+        try:
+            _headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            _url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d"
+            _r   = requests.get(_url, headers=_headers, timeout=10).json()
+            _meta = _r.get("chart",{}).get("result",[{}])[0].get("meta",{})
+            if _meta.get("regularMarketPrice"):
+                result["currentPrice"]  = _meta["regularMarketPrice"]
+                result.setdefault("marketCap",    _meta.get("marketCap"))
+                result.setdefault("sharesOutstanding", _meta.get("sharesOutstanding"))
+        except Exception: pass
+
     return result
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -546,11 +583,31 @@ def get_news_sentiment(ticker, company_name, news_key):
             "neg_pct":sum(1 for l in labels if l=="negative")/n*100,
             "neu_pct":sum(1 for l in labels if l=="neutral")/n*100}
 
+def _yf_download_robust(tickers, period, interval):
+    """yf.download con fallback su singolo ticker se il multi-ticker fallisce."""
+    try:
+        px = yf.download(tickers, period=period, interval=interval,
+                         auto_adjust=True, progress=False, threads=False)
+        if "Close" in px.columns:
+            return px["Close"]
+        if isinstance(px, pd.DataFrame) and not px.empty:
+            return px
+    except Exception: pass
+    # fallback: scarica uno per uno
+    frames = {}
+    for t in (tickers if isinstance(tickers, list) else [tickers]):
+        try:
+            h = yf.download(t, period=period, interval=interval,
+                            auto_adjust=True, progress=False)
+            if not h.empty:
+                frames[t] = h["Close"] if "Close" in h.columns else h.iloc[:, 0]
+        except Exception: pass
+    return pd.DataFrame(frames) if frames else pd.DataFrame()
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_price_history_daily(ticker, benchmark="SPY", period="2y"):
     try:
-        px = yf.download([ticker, benchmark], period=period, interval="1d",
-                         auto_adjust=True, progress=False)["Close"]
+        px = _yf_download_robust([ticker, benchmark], period, "1d")
         if isinstance(px, pd.Series): px = px.to_frame(ticker)
         return px.dropna(how="all")
     except Exception:
@@ -559,8 +616,7 @@ def get_price_history_daily(ticker, benchmark="SPY", period="2y"):
 @st.cache_data(ttl=900, show_spinner=False)
 def get_price_history_weekly(ticker, benchmark="SPY", period="5y"):
     try:
-        px = yf.download([ticker, benchmark], period=period, interval="1wk",
-                         auto_adjust=True, progress=False)["Close"]
+        px = _yf_download_robust([ticker, benchmark], period, "1wk")
         if isinstance(px, pd.Series): px = px.to_frame(ticker)
         return px.dropna(how="all")
     except Exception:
@@ -571,12 +627,20 @@ def get_forward_data(ticker):
     result = {}
     try:
         tk = yf.Ticker(ticker)
-        info = tk.info
+        # Prova fast_info prima (più affidabile su Cloud)
+        try:
+            fi = tk.fast_info
+            result["trailingPE"] = fi.get("trailingPE") or fi.get("pe_trailing")
+        except Exception: pass
+        # Poi info completo
+        info = {}
+        try: info = tk.info or {}
+        except Exception: pass
         for k in ["forwardPE","forwardEps","trailingEps","earningsGrowth",
                   "revenueGrowth","trailingPE","recommendationKey","targetMeanPrice",
                   "targetLowPrice","targetHighPrice","targetMedianPrice",
                   "numberOfAnalystOpinions"]:
-            result[k] = info.get(k)
+            result.setdefault(k, info.get(k))
         try:
             rec = tk.recommendations_summary
             if rec is not None and not rec.empty:
