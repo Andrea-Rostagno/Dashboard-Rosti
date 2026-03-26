@@ -2278,16 +2278,6 @@ with tab6:
                 _da_yf = float(_em_ttm) - float(_om_ttm)
                 if 0.005 < _da_yf < 0.15:
                     da_pct_def = _da_yf
-        # EU TTM overrides: ESEF puo avere dati stale/parziali -> usa yfinance TTM
-        if _is_eu_wacc:
-            _om_ttm = mkt.get("operatingMargins")
-            _em_ttm = mkt.get("ebitdaMargins")
-            if _om_ttm and 0.01 < float(_om_ttm) < 0.60:
-                ebit_margin_def = float(_om_ttm)
-            if _om_ttm and _em_ttm and float(_em_ttm) > float(_om_ttm):
-                _da_yf = float(_em_ttm) - float(_om_ttm)
-                if 0.005 < _da_yf < 0.15:
-                    da_pct_def = _da_yf
 
         # NWC operativo (AR+Inv-AP)/Rev — metodo incrementale come notebook
         nwc_pct_def = 0.05; _nwc_src = "default 5% (AR/AP non disponibili)"
