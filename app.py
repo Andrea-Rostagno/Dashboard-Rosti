@@ -106,11 +106,11 @@ html,body,[data-testid="stAppViewContainer"]{background:#0d1117;color:#e6edf3;}
 # ═══════════════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
-def fmt_m(v):
+def fmt_m(v, sym="$"):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "N/A"
     b = v / 1e9
-    if abs(b) >= 1: return f"${b:,.1f}B"
-    return f"${v/1e6:,.1f}M"
+    if abs(b) >= 1: return f"{sym}{b:,.1f}B"
+    return f"{sym}{v/1e6:,.1f}M"
 
 def fmt_pct(v, dec=1):
     if v is None or (isinstance(v, float) and np.isnan(v)): return "N/A"
@@ -208,6 +208,335 @@ GAAP_TAGS = {
                           "WeightedAverageNumberOfSharesOutstandingBasic"],
 }
 
+# ═══════════════════════════════════════════════════════════════
+# EUROPEAN MARKET SUPPORT — OpenFIGI → GLEIF → ESEF XBRL
+# ═══════════════════════════════════════════════════════════════
+EUROPEAN_SUFFIXES = {
+    ".MI": ("Italy",       "EUR", "€",   "IM",  "Borsa Italiana"),
+    ".PA": ("France",      "EUR", "€",   "FP",  "Euronext Paris"),
+    ".MC": ("Spain",       "EUR", "€",   "SM",  "Bolsa Madrid"),
+    ".DE": ("Germany",     "EUR", "€",   "GY",  "XETRA"),
+    ".F":  ("Germany",     "EUR", "€",   "GF",  "Frankfurt"),
+    ".AS": ("Netherlands", "EUR", "€",   "NA",  "Euronext Amsterdam"),
+    ".BR": ("Belgium",     "EUR", "€",   "BB",  "Euronext Brussels"),
+    ".LS": ("Portugal",    "EUR", "€",   "PL",  "Euronext Lisbon"),
+    ".L":  ("UK",          "GBP", "\u00a3",  "LN",  "London Stock Exchange"),
+    ".VX": ("Switzerland", "CHF", "CHF ", "VX",  "SIX Swiss Exchange"),
+    ".ST": ("Sweden",      "SEK", "kr ",  "SS",  "Nasdaq Stockholm"),
+    ".OL": ("Norway",      "NOK", "kr ",  "OS",  "Oslo Bors"),
+    ".HE": ("Finland",     "EUR", "€",   "HE",  "Nasdaq Helsinki"),
+    ".CO": ("Denmark",     "DKK", "kr ",  "DC",  "Nasdaq Copenhagen"),
+}
+
+def detect_market(ticker: str):
+    """Returns (country, currency_code, currency_symbol, openfigi_exch, exchange_name, suffix) or US tuple."""
+    t = ticker.upper()
+    for sfx, info in EUROPEAN_SUFFIXES.items():
+        if t.endswith(sfx.upper()):
+            return info + (sfx,)
+    return ("US", "USD", "$", None, "SEC EDGAR", None)
+
+IFRS_TAGS = {
+    "revenue": [
+        "ifrs-full:Revenue",
+        "ifrs-full:RevenueFromContractsWithCustomers",
+        "ifrs-full:SalesAndOtherOperatingRevenue",
+    ],
+    "gross_profit": ["ifrs-full:GrossProfit"],
+    "operating_income": [
+        "ifrs-full:ProfitLossFromOperatingActivities",
+        "ifrs-full:OperatingProfit",
+    ],
+    "net_income": [
+        "ifrs-full:ProfitLoss",
+        "ifrs-full:ProfitLossAttributableToOwnersOfParent",
+    ],
+    "total_assets": ["ifrs-full:Assets"],
+    "total_equity": [
+        "ifrs-full:Equity",
+        "ifrs-full:EquityAttributableToOwnersOfParent",
+    ],
+    "total_liabilities": ["ifrs-full:Liabilities"],
+    "current_assets": ["ifrs-full:CurrentAssets"],
+    "current_liabilities": ["ifrs-full:CurrentLiabilities"],
+    "cash": [
+        "ifrs-full:CashAndCashEquivalents",
+        "ifrs-full:CashAndBankBalancesAtCentralBanks",
+    ],
+    "long_term_debt": [
+        "ifrs-full:NoncurrentPortionOfLongtermBorrowings",
+        "ifrs-full:LongtermBorrowings",
+    ],
+    "operating_cf": ["ifrs-full:CashFlowsFromUsedInOperatingActivities"],
+    "capex": [
+        "ifrs-full:PurchaseOfPropertyPlantAndEquipment",
+        "ifrs-full:AcquisitionOfPropertyPlantAndEquipmentIntangibleAssetsAndOtherLongtermAssets",
+    ],
+    "depreciation": [
+        "ifrs-full:DepreciationAndAmortisationExpense",
+        "ifrs-full:DepreciationAmortisationAndImpairmentLossReversalOfImpairmentLossRecognisedInProfitOrLoss",
+    ],
+    "interest_expense": ["ifrs-full:FinanceCosts", "ifrs-full:InterestExpense"],
+    "income_tax": ["ifrs-full:IncomeTaxExpenseContinuingOperations", "ifrs-full:TaxExpense"],
+    "shares_outstanding": [
+        "ifrs-full:NumberOfSharesOutstanding",
+        "ifrs-full:NumberOfSharesIssuedAndFullyPaid",
+    ],
+    "short_term_debt": [
+        "ifrs-full:CurrentPortionOfLongtermBorrowings",
+        "ifrs-full:ShorttermBorrowings",
+    ],
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_isin_from_ticker(ticker: str, exch_code: str):
+    """ISIN lookup: yfinance (primario) → OpenFIGI (fallback)."""
+    try:
+        _isin = yf.Ticker(ticker).isin
+        if _isin and len(_isin) == 12 and _isin[0].isalpha():
+            return _isin
+    except Exception:
+        pass
+    base_ticker = ticker.upper().rsplit(".", 1)[0]
+    try:
+        resp = requests.post(
+            "https://api.openfigi.com/v3/mapping",
+            json=[{"idType": "TICKER", "idValue": base_ticker, "exchCode": exch_code, "marketSecDes": "Equity"}],
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        ).json()
+        for item in resp:
+            for d in item.get("data", []):
+                if d.get("isin"):
+                    return d["isin"]
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_lei_from_isin(isin: str):
+    """GLEIF API: ISIN → (LEI, legal_name)."""
+    try:
+        r = requests.get(
+            f"https://api.gleif.org/api/v1/lei-records?filter[isin]={isin}&page[size]=1",
+            timeout=10
+        ).json()
+        data = r.get("data", [])
+        if data:
+            att = data[0]["attributes"]
+            lei = att["lei"]
+            name = att["entity"]["legalName"]["name"]
+            return lei, name
+    except Exception:
+        pass
+    return None, None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_esef_filings(lei: str, limit: int = 10):
+    """XBRL.org: LEI → list of ESEF annual filing dicts."""
+    try:
+        r = requests.get(
+            "https://filings.xbrl.org/api/filings",
+            params={"lei": lei, "limit": limit},
+            timeout=15
+        ).json()
+        return r.get("filings", r if isinstance(r, list) else [])
+    except Exception:
+        return []
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_esef_facts(filing_id: str) -> dict:
+    """XBRL.org facts API: filing_id → structured fact dict."""
+    try:
+        r = requests.get(
+            f"https://filings.xbrl.org/api/v1/filings/{filing_id}/facts",
+            timeout=20
+        ).json()
+        return r
+    except Exception:
+        return {}
+
+def extract_ifrs_facts(facts_json, ifrs_tags: dict) -> dict:
+    """Extract financial values from XBRL facts JSON using IFRS tag lists.
+    Returns a flat dict {metric_name: value}."""
+    result = {}
+    # facts_json may be a list of fact objects or a dict with 'facts' key
+    facts_list = []
+    if isinstance(facts_json, list):
+        facts_list = facts_json
+    elif isinstance(facts_json, dict):
+        facts_list = facts_json.get("facts", facts_json.get("data", []))
+    if not facts_list:
+        return result
+    # Build lookup: concept_name -> list of (value, period)
+    concept_map = {}
+    for fact in facts_list:
+        if not isinstance(fact, dict):
+            continue
+        concept = fact.get("concept", fact.get("conceptName", ""))
+        value = fact.get("value", fact.get("numericValue"))
+        period = fact.get("period", fact.get("endDate", ""))
+        if concept and value is not None:
+            try:
+                numeric_val = float(value)
+                concept_map.setdefault(concept, []).append((numeric_val, str(period)))
+            except (ValueError, TypeError):
+                pass
+    for metric, tag_list in ifrs_tags.items():
+        for tag in tag_list:
+            # Try both with and without namespace prefix
+            candidates = concept_map.get(tag, []) or concept_map.get(tag.split(":")[-1], [])
+            if candidates:
+                # Pick the most recent (largest period string, last year)
+                candidates_sorted = sorted(candidates, key=lambda x: x[1], reverse=True)
+                result[metric] = candidates_sorted[0][0]
+                break
+    return result
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_eu_fundamentals(ticker: str, years_back: int = 10):
+    """
+    Fetches European company fundamentals from official regulatory sources:
+    OpenFIGI (ISIN) → GLEIF (LEI) → ESEF XBRL filings (financials).
+    Returns (df, company_name, source_label, currency_code, currency_symbol).
+    """
+    market_info = detect_market(ticker)
+    country, currency_code, currency_symbol, openfigi_exch, exchange_name, suffix = market_info
+
+    company_name = ticker
+    source_label = f"{exchange_name} / ESEF XBRL"
+
+    # Step 1: ISIN via OpenFIGI
+    isin = None
+    if openfigi_exch:
+        try:
+            isin = get_isin_from_ticker(ticker, openfigi_exch)
+        except Exception:
+            pass
+
+    # Step 2: LEI via GLEIF
+    lei, name_from_gleif = None, None
+    if isin:
+        try:
+            lei, name_from_gleif = get_lei_from_isin(isin)
+            if name_from_gleif:
+                company_name = name_from_gleif
+        except Exception:
+            pass
+
+    # Step 3: ESEF filings from XBRL.org
+    filings = []
+    if lei:
+        try:
+            filings = get_esef_filings(lei)
+        except Exception:
+            pass
+
+    # Step 4: Parse financial facts from each filing
+    records = {}
+    for filing in filings[:years_back]:
+        period = filing.get("period_of_report", filing.get("reportDate",
+                 filing.get("period", filing.get("periodOfReport", ""))))
+        if not period:
+            continue
+        try:
+            year = int(str(period)[:4])
+        except (ValueError, TypeError):
+            continue
+        if year < datetime.now().year - years_back:
+            continue
+        filing_id = (filing.get("filing_id") or filing.get("id") or
+                     filing.get("filingId") or filing.get("filing"))
+        if not filing_id:
+            continue
+        try:
+            facts = get_esef_facts(str(filing_id))
+            year_data = extract_ifrs_facts(facts, IFRS_TAGS)
+            if year_data:
+                records[year] = year_data
+        except Exception:
+            pass
+
+    if not records:
+        raise ValueError(
+            f"Nessun dato ESEF trovato per {ticker} "
+            f"(ISIN: {isin}, LEI: {lei}). "
+            f"L'azienda potrebbe non avere filing ESEF disponibili su xbrl.org."
+        )
+
+    df = pd.DataFrame.from_dict(records, orient="index").sort_index()
+    df.index.name = "year"
+    df = df[df.index >= datetime.now().year - years_back].copy()
+    df = _add_derived(df)
+
+    # ── yfinance merge: sempre attivo — aggiunge anni mancanti da ESEF (es. 2024) ──
+    # ESEF ha priorita: anni gia presenti in df vengono saltati
+    _esef_yrs = set(df.index)
+    try:
+            _yf_tk2  = yf.Ticker(ticker)
+            _yf_inc2 = _yf_tk2.income_stmt
+            _yf_bs2  = _yf_tk2.balance_sheet
+            _yf_cf2  = _yf_tk2.cashflow
+            _yf_rows2 = []
+            if not _yf_inc2.empty:
+                for _col2 in _yf_inc2.columns:
+                    _yr2 = _col2.year
+                    if _yr2 in _esef_yrs:
+                        continue  # ESEF ha priorità
+                    _r2 = {}
+                    for _yfc, _nbc in [
+                        ("Total Revenue","revenue"),("Net Income","net_income"),
+                        ("EBIT","operating_income"),("Gross Profit","gross_profit"),
+                        ("Interest Expense","interest_expense"),
+                        ("Income Tax Expense","income_tax"),("Pretax Income","ebt"),
+                        ("EBITDA","ebitda"),
+                        ("Depreciation And Amortization","depreciation"),
+                    ]:
+                        try: _r2[_nbc] = float(_yf_inc2.loc[_yfc, _col2])
+                        except: pass
+                    if not _yf_bs2.empty and _col2 in _yf_bs2.columns:
+                        for _yfc, _nbc in [
+                            ("Total Assets","total_assets"),
+                            ("Stockholders Equity","total_equity"),
+                            ("Total Debt","total_debt"),
+                            ("Cash And Cash Equivalents","cash"),
+                            ("Current Assets","current_assets"),
+                            ("Current Liabilities","current_liabilities"),
+                            ("Accounts Receivable","accounts_receivable"),
+                            ("Accounts Payable","accounts_payable"),
+                            ("Inventory","inventory"),
+                            ("Other Short Term Investments","short_term_investments"),
+                            ("Ordinary Shares Number","shares_outstanding"),
+                        ]:
+                            try: _r2[_nbc] = float(_yf_bs2.loc[_yfc, _col2])
+                            except: pass
+                    if not _yf_cf2.empty and _col2 in _yf_cf2.columns:
+                        for _yfc, _nbc in [
+                            ("Operating Cash Flow","operating_cf"),
+                            ("Capital Expenditure","capex"),
+                            ("Depreciation And Amortization","depreciation"),
+                            ("Dividends Paid","dividends_paid"),
+                        ]:
+                            try: _r2[_nbc] = float(_yf_cf2.loc[_yfc, _col2])
+                            except: pass
+                    if _r2:
+                        _yf_rows2.append((_yr2, _r2))
+            if _yf_rows2:
+                _added_yrs = sorted([y for y, _ in _yf_rows2])
+                _yf_df2 = pd.DataFrame([r for _, r in sorted(_yf_rows2)],
+                                        index=[y for y, _ in sorted(_yf_rows2)])
+                _yf_df2.index.name = df.index.name
+                df = pd.concat([_yf_df2, df]).sort_index()
+                df = _add_derived(df)
+                source_label = source_label + f" + yfinance {_added_yrs}"
+    except Exception:
+        pass
+
+    return df, company_name, source_label, currency_code, currency_symbol
+
+# ═══════════════════════════════════════════════════════════════
+# SEC EDGAR
+# ═══════════════════════════════════════════════════════════════
 def get_cik(ticker):
     url = "https://www.sec.gov/files/company_tickers.json"
     r = requests.get(url, headers=SEC_HDRS, timeout=15)
@@ -386,6 +715,18 @@ def get_market_data(ticker, fmp_key):
                 result.setdefault("priceToSalesTrailing12Months",
                                   info.get("priceToSalesTrailing12Months"))
                 result.setdefault("description",      info.get("longBusinessSummary",""))
+                result.setdefault("operatingMargins", info.get("operatingMargins"))
+                result.setdefault("ebitdaMargins",    info.get("ebitdaMargins"))
+                result.setdefault("grossMargins",     info.get("grossMargins"))
+                result.setdefault("totalDebt",        info.get("totalDebt"))
+                result.setdefault("totalRevenue",     info.get("totalRevenue"))
+                result.setdefault("revenueGrowth",    info.get("revenueGrowth"))
+                result.setdefault("operatingMargins", info.get("operatingMargins"))
+                result.setdefault("ebitdaMargins",    info.get("ebitdaMargins"))
+                result.setdefault("grossMargins",     info.get("grossMargins"))
+                result.setdefault("totalDebt",        info.get("totalDebt"))
+                result.setdefault("totalRevenue",     info.get("totalRevenue"))
+                result.setdefault("revenueGrowth",    info.get("revenueGrowth"))
         except Exception: pass
 
     # ── Fallback 4: Yahoo Finance API diretta (senza yfinance) ──────────────
@@ -406,16 +747,46 @@ def get_market_data(ticker, fmp_key):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_fundamentals(ticker, years_back):
+    """
+    Returns (df, company_name, source_label, currency_code, currency_symbol).
+    Routes European tickers to ESEF XBRL path, US tickers to SEC EDGAR.
+    """
+    market_info = detect_market(ticker)
+    country, currency_code, currency_symbol = market_info[0], market_info[1], market_info[2]
+
+    # European market path
+    if country != "US":
+        try:
+            df, name, src, cc, cs = build_eu_fundamentals(ticker, years_back)
+            return df, name, src, cc, cs
+        except Exception as e_eu:
+            import streamlit as _st
+            try:
+                _st.warning(f"ESEF non disponibile per {ticker}: {e_eu}. Fallback yfinance.")
+            except Exception:
+                pass
+            # Fallback to yfinance for EU tickers
+            try:
+                df = build_yf_fundamentals(ticker, years_back)
+                try:
+                    _name = yf.Ticker(ticker).info.get("longName", ticker)
+                except Exception:
+                    _name = ticker
+                return df, _name, "yfinance (EU fallback)", currency_code, currency_symbol
+            except Exception as e_yf:
+                raise RuntimeError(f"EU={e_eu} | yf={e_yf}")
+
+    # US path: SEC EDGAR → yfinance fallback
     try:
         cik, name = get_cik(ticker)
         time.sleep(0.3)
         facts = fetch_companyfacts(cik)
         df = build_sec_fundamentals(facts, years_back)
         if df.empty: raise ValueError("DataFrame vuoto")
-        return df, name, "SEC EDGAR XBRL"
+        return df, name, "SEC EDGAR XBRL", "USD", "$"
     except Exception as e_sec:
         try:
-            return build_yf_fundamentals(ticker, years_back), ticker, "yfinance (fallback)"
+            return build_yf_fundamentals(ticker, years_back), ticker, "yfinance (fallback)", "USD", "$"
         except Exception as e_yf:
             raise RuntimeError(f"SEC={e_sec} | yf={e_yf}")
 
@@ -673,6 +1044,7 @@ with st.sidebar:
     st.markdown("---")
     ticker = st.text_input("**Ticker**", value="AAPL",
                            help="Es: AAPL, MSFT, NVDA, PLTR, TSLA").upper().strip()
+    st.caption("🇮🇹 ENI.MI · 🇫🇷 AIR.PA · 🇩🇪 SAP.DE · 🇪🇸 SAN.MC · 🇬🇧 BP.L · 🇨🇭 NESN.VX")
     years_back = st.slider("**Anni di storia**", 3, 15, 10)
 
     st.markdown("---")
@@ -754,7 +1126,7 @@ if not _show_analysis:
 # ═══════════════════════════════════════════════════════════════
 with st.spinner(f"📡 Carico fondamentali per **{ticker}**…"):
     try:
-        df_fund, company_name, data_source = load_fundamentals(ticker, years_back)
+        df_fund, company_name, data_source, curr_code, curr_sym = load_fundamentals(ticker, years_back)
     except Exception as e:
         st.error(f"❌ Impossibile caricare dati per **{ticker}**: {e}")
         st.stop()
@@ -914,33 +1286,55 @@ with st.spinner("📡 Carico storico prezzi…"):
     fwd_data  = get_forward_data(ticker)
 
 # ── Beta OLS + Blume + WACC ───────────────────────────────────────────────
-beta_ols  = float(beta or 1.0)
-r_sq_ols  = 0.0
-n_obs_ols = 0
-beta_ret_x = np.array([])  # for scatter plot
-beta_ret_y = np.array([])
-rf_rate   = 0.043
-erp       = 0.045
+# Detect market for RF/ERP calibration
+_mkt_info_wacc = detect_market(ticker)
+_country_wacc  = _mkt_info_wacc[0]
+_is_eu_wacc    = _country_wacc != "US"
 
-if not px_weekly.empty and ticker in px_weekly.columns and "SPY" in px_weekly.columns:
-    try:
-        from scipy import stats as _sp_stats
-        ret_s = px_weekly[ticker].pct_change().dropna()
-        ret_b = px_weekly["SPY"].pct_change().dropna()
-        common_idx = ret_s.index.intersection(ret_b.index)
-        if len(common_idx) > 20:
-            xv = ret_b.reindex(common_idx).values
-            yv = ret_s.reindex(common_idx).values
-            mask = ~(np.isnan(xv) | np.isnan(yv))
-            xv, yv = xv[mask], yv[mask]
-            if len(xv) > 10:
-                sl, ic, rv, pv, se = _sp_stats.linregress(xv, yv)
-                beta_ols  = float(sl)
-                r_sq_ols  = float(rv**2)
-                n_obs_ols = len(xv)
-                beta_ret_x = xv * 100
-                beta_ret_y = yv * 100
-    except Exception: pass
+# RF and ERP: EU uses ECB/OAT benchmark; US uses Treasury
+if _is_eu_wacc:
+    rf_rate = 0.030   # EUR risk-free (French OAT 10Y / Bund, ~3%)
+    erp     = 0.0549  # ERP EU (Damodaran, country risk premium Europe)
+else:
+    rf_rate = 0.043   # US 10Y Treasury
+    erp     = 0.045   # ERP US (Damodaran)
+
+# Beta: use yfinance local-market beta for EU stocks (more accurate than vs SPY)
+# For US stocks: compute OLS regression vs SPY
+beta_ols   = float(beta or 1.0)  # yfinance beta as starting point
+r_sq_ols   = 0.0
+n_obs_ols  = 0
+beta_ret_x = np.array([])
+beta_ret_y = np.array([])
+
+if _is_eu_wacc:
+    # EU stock: prefer yfinance local beta (vs own index), fallback to 1.0
+    _yf_beta_eu = mkt.get("beta")
+    if _yf_beta_eu and not pd.isna(float(_yf_beta_eu or np.nan)):
+        beta_ols = max(0.2, min(2.5, float(_yf_beta_eu)))
+    else:
+        beta_ols = 1.0
+else:
+    # US stock: compute OLS regression vs SPY
+    if not px_weekly.empty and ticker in px_weekly.columns and "SPY" in px_weekly.columns:
+        try:
+            from scipy import stats as _sp_stats
+            ret_s = px_weekly[ticker].pct_change().dropna()
+            ret_b = px_weekly["SPY"].pct_change().dropna()
+            common_idx = ret_s.index.intersection(ret_b.index)
+            if len(common_idx) > 20:
+                xv = ret_b.reindex(common_idx).values
+                yv = ret_s.reindex(common_idx).values
+                mask = ~(np.isnan(xv) | np.isnan(yv))
+                xv, yv = xv[mask], yv[mask]
+                if len(xv) > 10:
+                    sl, ic, rv, pv, se = _sp_stats.linregress(xv, yv)
+                    beta_ols  = float(sl)
+                    r_sq_ols  = float(rv**2)
+                    n_obs_ols = len(xv)
+                    beta_ret_x = xv * 100
+                    beta_ret_y = yv * 100
+        except Exception: pass
 
 beta_blume = 2/3 * beta_ols + 1/3
 mktcap_b   = (market_cap or 1e11) / 1e9
@@ -949,7 +1343,13 @@ ke_calc    = rf_rate + beta_blume * erp + size_prem
 
 int_exp_last = last_valid(df_fund.get("interest_expense", pd.Series()))
 debt_last2   = last_valid(df_fund.get("total_debt", pd.Series()))
-tax_rate_w   = 0.21
+# EU: yfinance totalDebt = solo debito finanziario (bonds + bank loans)
+# ESEF total_debt puo includere passivita totali
+if _is_eu_wacc:
+    _td_yf_w = mkt.get("totalDebt")
+    if _td_yf_w and float(_td_yf_w) > 0:
+        debt_last2 = float(_td_yf_w)
+tax_rate_w   = 0.25 if _is_eu_wacc else 0.21  # EU 25%, US 21%
 if "income_tax" in df_fund.columns and "operating_income" in df_fund.columns:
     _oi_w = df_fund["operating_income"].clip(lower=1)
     _tr_w = (df_fund["income_tax"] / _oi_w).clip(0, 0.40).dropna()
@@ -960,7 +1360,7 @@ kd_calc    = kd_pretax * (1 - tax_rate_w)
 eq_w_wacc  = (market_cap / (market_cap + (debt_last2 or 0))) if market_cap and market_cap > 0 else 0.8
 debt_w_wacc= 1 - eq_w_wacc
 wacc_calc  = ke_calc * eq_w_wacc + kd_calc * debt_w_wacc
-wacc_calc  = max(0.05, min(0.25, wacc_calc))
+wacc_calc  = max(0.04, min(0.25, wacc_calc))
 
 # Rolling Beta (60-day window)
 rolling_beta = pd.Series(dtype=float)
@@ -1165,17 +1565,20 @@ if (not np.isnan(bvps_last or np.nan) and not np.isnan(eps_last3 or np.nan)
 
 div_ps2 = float(mkt.get("dividendPerShare") or mkt.get("dividendRate") or 0)
 tgr_ddm = 0.025
-ddm_fv  = np.nan
+ddm_fv  = np.nan  # simple DDM fallback (Gordon); replaced by DDM 2-stage in Tab 6
 if div_ps2 > 0 and wacc_calc > tgr_ddm:
     ddm_fv = div_ps2 * (1 + tgr_ddm) / (wacc_calc - tgr_ddm)
 
 is_bank = any(w in sector.lower() for w in ["financial", "bank", "insurance", "capital market"])
 
 # ── Multi-model blend ─────────────────────────────────────────────────────
+# Values are populated by Tab 6 DCF section (fair_values dict) — initialized here
+fair_values  = {}  # will be populated inside Tab 6
 _sc_wfv2 = scenario_results.get("Weighted", {}).get("fair_value", np.nan)
-_dcf_fv2 = intrinsic_price_dcf if "intrinsic_price_dcf" in dir() else np.nan
+# intrinsic_price_dcf is set inside Tab 6; read back via fair_values after tab renders
+_dcf_fv2 = np.nan  # will be updated after Tab 6 executes
 if is_bank:
-    _dcf_fv2 = np.nan; _sc_wfv2 = np.nan
+    _sc_wfv2 = np.nan
 _mult_fv2 = np.nan
 if market_cap and "net_income" in df_fund.columns:
     _ni_mm = last_valid(df_fund["net_income"])
@@ -1186,13 +1589,15 @@ if market_cap and "net_income" in df_fund.columns:
 _all_mv = {}
 if not is_bank:
     if not np.isnan(_dcf_fv2 or np.nan) and (_dcf_fv2 or 0) > 0:
-        _all_mv["DCF"] = (_dcf_fv2, 0.40)
+        _all_mv["DCF (UFCF)"] = (_dcf_fv2, 0.40)
     if not np.isnan(_mult_fv2 or np.nan) and (_mult_fv2 or 0) > 0:
-        _all_mv["Multipli Peer"] = (_mult_fv2, 0.30)
+        _all_mv["Multipli Peer"] = (_mult_fv2, 0.25)
     if not np.isnan(_sc_wfv2 or np.nan) and (_sc_wfv2 or 0) > 0:
-        _all_mv["Scenario"] = (_sc_wfv2, 0.20)
+        _all_mv["Scenario"] = (_sc_wfv2, 0.15)
     if not np.isnan(rim_fv or np.nan) and (rim_fv or 0) > 0:
         _all_mv["RIM"] = (rim_fv, 0.10)
+    # FCFE and DDM 2-stage: populated after Tab 6 via fair_values
+    # (blend recalculated in Tab 11 using fair_values directly)
 else:
     if not np.isnan(_mult_fv2 or np.nan) and (_mult_fv2 or 0) > 0:
         _all_mv["Multipli P/E"] = (_mult_fv2, 0.35)
@@ -1255,9 +1660,9 @@ with col_inf:
 # KPI bar
 st.markdown("")
 k1,k2,k3,k4,k5,k6 = st.columns(6)
-with k1: card("Prezzo",    f"${price:.2f}" if price else "N/A")
-with k2: card("Market Cap", fmt_m(market_cap))
-with k3: card("Revenue",   fmt_m(last_valid(df_fund.get("revenue",pd.Series()))) if "revenue" in df_fund.columns else "N/A")
+with k1: card("Prezzo",    f"{curr_sym}{price:.2f}" if price else "N/A")
+with k2: card("Market Cap", fmt_m(market_cap, sym=curr_sym))
+with k3: card("Revenue",   fmt_m(last_valid(df_fund.get("revenue",pd.Series())), sym=curr_sym) if "revenue" in df_fund.columns else "N/A")
 with k4:
     nm_kpi = safe_div(last_valid(df_fund.get("net_income",pd.Series())),
                       last_valid(df_fund.get("revenue",pd.Series())))
@@ -1328,7 +1733,7 @@ with tab1:
                                         marker=dict(size=5),showlegend=False),row=1,col=col_idx)
     fig_ov.update_layout(**LAYOUT,height=380,
                          title_text=f"{company_name} — Overview Storico")
-    fig_ov.update_yaxes(tickprefix="$",ticksuffix="M")
+    fig_ov.update_yaxes(tickprefix=curr_sym,ticksuffix="M")
     st.plotly_chart(fig_ov,use_container_width=True)
 
     # Metriche chiave tabella
@@ -1426,7 +1831,7 @@ with tab2:
         c_spread  = [GREEN if s>=0 else RED for s in spread_arr]
 
         fig_rv = make_subplots(rows=1,cols=2,
-            subplot_titles=["ROIC vs WACC nel Tempo","Economic Spread (ROIC − WACC)"])
+            subplot_titles=["ROIC vs WACC nel Tempo","Economic Spread (ROIC - WACC)"])
         fig_rv.add_trace(go.Scatter(x=years_arr,y=roic_arr,name="ROIC %",
                                     line=dict(color=COLORS[0],width=2.5),
                                     mode="lines+markers",marker=dict(size=7)),row=1,col=1)
@@ -1453,7 +1858,7 @@ with tab2:
             with m2: card("WACC (calc.)", fmt_pct(wacc_calc))
             with m3: card("Spread",f"{spread_last:+.1f}%", GREEN if spread_last>=0 else RED)
             v_roic = "✅ Value Creation" if spread_last>=0 else "⚠️ Value Destruction"
-            st.markdown(f"**{v_roic}** — Spread ROIC−WACC: `{spread_last:+.1f}%`")
+            st.markdown(f"**{v_roic}** — Spread ROIC-WACC: `{spread_last:+.1f}%`")
     else:
         st.info("Dati ROIC non disponibili.")
 
@@ -1516,7 +1921,7 @@ with tab3:
             fig_cf.add_trace(go.Scatter(x=sv.index.tolist(),y=(sv*100).values.tolist(),
                                         name=lbl,line=dict(color=col2,width=2),
                                         mode="lines+markers",marker=dict(size=5)),row=1,col=2)
-    fig_cf.update_yaxes(tickprefix="$",ticksuffix="M",row=1,col=1)
+    fig_cf.update_yaxes(tickprefix=curr_sym,ticksuffix="M",row=1,col=1)
     fig_cf.update_yaxes(ticksuffix="%",row=1,col=2)
     plo(fig_cf,380)
 
@@ -1750,11 +2155,8 @@ with tab5:
 # TAB 6 — DCF & SENSITIVITY (ex tab5)
 # ──────────────────────────────────────────────────────────────
 with tab6:
-    fair_values       = {}
-    premium_disc      = None
-    intrinsic_price_dcf = None
-    fair_values       = {}
-    premium_disc      = None
+    fair_values         = {}
+    premium_disc        = None
     intrinsic_price_dcf = None
 
     # Multipli
@@ -1819,207 +2221,542 @@ with tab6:
         if shares:
             bvps = last_valid(df_fund["total_equity"])/shares
             if not pd.isna(bvps):
-                st.markdown(f"**Book Value per share**: `${bvps:.2f}`")
+                st.markdown(f"**Book Value per share**: `{curr_sym}{bvps:.2f}`")
 
-    # DCF
+    # ── DCF Avanzato (UFCF/FCFF) — replica notebook analisi_universale_v1 ──
     st.markdown("")
-    section("🔮","DCF — Discounted Cash Flow")
+    section("🔮","DCF Avanzato — UFCF / FCFF (Mid-Year Convention)")
+
+    # Bank/financial sector detection
+    _BANK_KW_S = {"Bank","Insurance","Financial","Thrift","Savings","Credit"}
+    _BANK_KW_I = {"Bank","Insurance","Investment","Brokerage","Mortgage","Asset Management"}
+    _is_bank_dcf = (any(kw in sector for kw in _BANK_KW_S) or
+                    any(kw in industry for kw in _BANK_KW_I))
+    if _is_bank_dcf:
+        st.warning(f"⚠️ {ticker} è un settore finanziario. Il DCF FCFF NON è applicabile a banche/assicurazioni. Modelli corretti: DDM o P/Book. Risultati puramente indicativi.")
+
     if price:
-        rev_cagr_auto = float(np.clip(rev_cagr_5y if not pd.isna(rev_cagr_5y) else 0.10,-0.05,0.30))
-        om_hist = last_valid(margins.get("Operating Margin",pd.Series()))
-        ebit_margin_def = max(float(om_hist) if not pd.isna(om_hist) else 0.15, 0.05)
-        tax_rate_dcf = 0.21
-        if "income_tax" in df_fund.columns and "operating_income" in df_fund.columns:
-            _oi = df_fund["operating_income"].clip(lower=1)
-            _tr = (df_fund["income_tax"]/_oi).clip(0,.40).dropna()
-            if not _tr.empty: tax_rate_dcf = float(_tr.iloc[-1])
-        capex_pct_def = 0.05
-        if "capex" in df_fund.columns and "revenue" in df_fund.columns:
-            _cx = (df_fund["capex"].abs()/df_fund["revenue"].replace(0,np.nan)).dropna()
-            if not _cx.empty: capex_pct_def = float(_cx.iloc[-1])
+        # ── Estrai serie storiche (come Cell 35 notebook) ────────────────
+        _rev_s  = df_fund.get("revenue",          pd.Series(dtype=float))
+        _ebit_s = df_fund.get("operating_income",  pd.Series(dtype=float))
+        _da_s   = df_fund.get("depreciation",      pd.Series(dtype=float))
+        _cx_s   = df_fund.get("capex",             pd.Series(dtype=float)).abs()
+        _ni_s   = df_fund.get("net_income",        pd.Series(dtype=float))
+        _ebt_s  = df_fund.get("ebt",              pd.Series(dtype=float))
+        _tax_s  = df_fund.get("income_tax",        pd.Series(dtype=float))
+        _cash_s = df_fund.get("cash",              pd.Series(dtype=float))
+        _debt_s = df_fund.get("total_debt",        pd.Series(dtype=float))
+        _ar_s   = df_fund.get("accounts_receivable",pd.Series(dtype=float))
+        _ap_s   = df_fund.get("accounts_payable",   pd.Series(dtype=float))
+        _inv_s  = df_fund.get("inventory",          pd.Series(dtype=float)).fillna(0)
+        _sti_s  = df_fund.get("short_term_investments",pd.Series(dtype=float)).fillna(0)
 
-        with st.expander("⚙️ Parametri DCF",expanded=False):
-            d1,d2,d3 = st.columns(3)
-            with d1:
-                dcf_wacc   = st.slider("WACC DCF (%)",5.,20.,float(min(max(wacc_calc*100,5.),20.)),.5,key="dw")/100
-                dcf_term_g = st.slider("Terminal Growth (%)",1.,6.,3.,.5,key="dtg")/100
-                dcf_years  = st.slider("Anni proiezione",5,15,10,1,key="dy")
-            with d2:
-                dcf_ebit   = st.slider("EBIT Margin (%)",0.,50.,float(ebit_margin_def*100),.5,key="de")/100
-                dcf_tax    = st.slider("Tax Rate (%)",10.,40.,float(tax_rate_dcf*100),.5,key="dt")/100
-            with d3:
-                dcf_capex  = st.slider("CapEx/Revenue (%)",0.,30.,float(capex_pct_def*100),.5,key="dc")/100
-                g_base_pct = st.slider("Rev Growth Anno 1 (%)",-10.,60.,float(rev_cagr_auto*100*1.1),.5,key="dg1")
+        def _hmean(num, den, n=3):
+            idx2 = num.dropna().index.intersection(den.dropna().index)
+            if idx2.empty: return np.nan
+            r = (num.reindex(idx2)/den.reindex(idx2).replace(0,np.nan)).dropna()
+            return float(np.nanmean(r.iloc[-min(n,len(r)):]))
 
-        dcf_rev_growth = [g_base_pct/100*(1-i*0.07) for i in range(dcf_years)]
-        rev_base  = last_valid(df_fund.get("revenue",pd.Series()))
-        shares_dcf = (last_valid(df_fund.get("shares_outstanding",pd.Series())) or shares or None)
-        nd_dcf     = ((last_valid(df_fund.get("total_debt",pd.Series())) or 0)
-                      - (last_valid(df_fund.get("cash",pd.Series())) or 0))
+        def _cagr3(s, n=3):
+            s = s.dropna()
+            if len(s)<2: return np.nan
+            n2=min(n,len(s)-1); v0,vn=float(s.iloc[-n2-1]),float(s.iloc[-1])
+            return (vn/v0)**(1/n2)-1 if v0>0 else np.nan
 
-        if rev_base and shares_dcf and rev_base>0 and shares_dcf>0:
-            proj=[]; rev_t=rev_base; pv_total=0.0
-            for t in range(1,dcf_years+1):
-                g_t    = dcf_rev_growth[t-1] if t<=len(dcf_rev_growth) else dcf_term_g
-                rev_t  = rev_t*(1+g_t)
-                nopat_t= rev_t*dcf_ebit*(1-dcf_tax)
-                fcf_t  = nopat_t-rev_t*dcf_capex
-                pv_t   = fcf_t/(1+dcf_wacc)**t
-                pv_total+=pv_t
-                proj.append({"Anno":datetime.now().year+t,"G%":g_t*100,
-                             "Rev ($M)":rev_t/1e6,"NOPAT ($M)":nopat_t/1e6,
-                             "FCF ($M)":fcf_t/1e6,"PV ($M)":pv_t/1e6})
-            df_proj = pd.DataFrame(proj).set_index("Anno")
-            fcf_last_dcf = proj[-1]["FCF ($M)"]*1e6
-            if dcf_wacc>dcf_term_g:
-                tv = fcf_last_dcf*(1+dcf_term_g)/(dcf_wacc-dcf_term_g)
-                pv_tv = tv/(1+dcf_wacc)**dcf_years
-            else:
-                pv_tv=0
-            ev_dcf = pv_total+pv_tv
-            eq_val = ev_dcf-nd_dcf
-            intrinsic_price_dcf = eq_val/shares_dcf
-            fair_values["DCF"] = intrinsic_price_dcf
+        _rev_base = last_valid(_rev_s)
+        rev_cagr_auto = float(np.clip(_cagr3(_rev_s,3) or 0.08,-0.05,0.30))
+        ebit_margin_def = float(np.clip(_hmean(_ebit_s,_rev_s) or 0.12,0.01,0.60))
+        da_pct_def   = float(np.clip(_hmean(_da_s,_rev_s) or 0.03,0.0,0.20))
+        capex_pct_def= float(np.clip(_hmean(_cx_s,_rev_s) or 0.04,0.0,0.25))
+        # EU TTM overrides: ESEF puo avere dati stale/parziali -> usa yfinance TTM
+        if _is_eu_wacc:
+            _om_ttm = mkt.get("operatingMargins")
+            _em_ttm = mkt.get("ebitdaMargins")
+            if _om_ttm and 0.01 < float(_om_ttm) < 0.60:
+                ebit_margin_def = float(_om_ttm)
+            if _om_ttm and _em_ttm and float(_em_ttm) > float(_om_ttm):
+                _da_yf = float(_em_ttm) - float(_om_ttm)
+                if 0.005 < _da_yf < 0.15:
+                    da_pct_def = _da_yf
+        # EU TTM overrides: ESEF puo avere dati stale/parziali -> usa yfinance TTM
+        if _is_eu_wacc:
+            _om_ttm = mkt.get("operatingMargins")
+            _em_ttm = mkt.get("ebitdaMargins")
+            if _om_ttm and 0.01 < float(_om_ttm) < 0.60:
+                ebit_margin_def = float(_om_ttm)
+            if _om_ttm and _em_ttm and float(_em_ttm) > float(_om_ttm):
+                _da_yf = float(_em_ttm) - float(_om_ttm)
+                if 0.005 < _da_yf < 0.15:
+                    da_pct_def = _da_yf
 
-            with st.expander("📋 Proiezioni anno per anno"):
-                st.dataframe(df_proj.style.format({
-                    "G%":"{:.1f}%","Rev ($M)":"${:,.0f}M",
-                    "NOPAT ($M)":"${:,.0f}M","FCF ($M)":"${:,.0f}M","PV ($M)":"${:,.0f}M"}),
+        # NWC operativo (AR+Inv-AP)/Rev — metodo incrementale come notebook
+        nwc_pct_def = 0.05; _nwc_src = "default 5% (AR/AP non disponibili)"
+        if not _ar_s.dropna().empty and not _ap_s.dropna().empty:
+            _idx_nwc = (_rev_s.dropna().index
+                        .intersection(_ar_s.dropna().index)
+                        .intersection(_ap_s.dropna().index))
+            if not _idx_nwc.empty:
+                _op_nwc = _ar_s.reindex(_idx_nwc)+_inv_s.reindex(_idx_nwc).fillna(0)-_ap_s.reindex(_idx_nwc)
+                _nwc_r  = (_op_nwc/_rev_s.reindex(_idx_nwc).replace(0,np.nan)).dropna()
+                if not _nwc_r.empty:
+                    nwc_pct_def = float(np.clip(np.nanmean(_nwc_r.iloc[-3:]),-0.10,0.20))
+                    _nwc_src = "NWC operativo (AR+Inv-AP)/Rev, media 3Y"
+
+        # Tax rate effettivo
+        tax_rate_dcf = tax_rate_w
+        if not _tax_s.dropna().empty and not _ebt_s.dropna().empty:
+            _idx_tax2 = _tax_s.dropna().index.intersection(_ebt_s[_ebt_s>0].dropna().index)
+            if not _idx_tax2.empty:
+                _t2 = (_tax_s.reindex(_idx_tax2).abs()/_ebt_s.reindex(_idx_tax2).abs()).clip(0,0.45)
+                tax_rate_dcf = float(np.nanmean(_t2.iloc[-3:]))
+
+        # Bridge values — pd.notna() required because np.nan is truthy, so "nan or 0" = nan
+        def _lv0(s): v=last_valid(s); return float(v) if pd.notna(v) else 0.0
+        _cash_b = _lv0(_cash_s) + _lv0(_sti_s)
+        _debt_b = _lv0(_debt_s)
+        # EU: yfinance totalDebt = solo debito finanziario (bonds+loans)
+        # ESEF puo restituire passivita totali (es. HO.PA 8.4B vs 1.8B corretto)
+        if _is_eu_wacc:
+            _td_dcf = mkt.get("totalDebt")
+            if _td_dcf and float(_td_dcf) > 0:
+                _debt_b = float(_td_dcf)
+        _sh_raw = last_valid(df_fund.get("shares_outstanding", pd.Series(dtype=float)))
+        _sh_b   = float(_sh_raw) if (pd.notna(_sh_raw) and _sh_raw > 0) else (float(shares) if shares else 0.0)
+        # EU shares fallback: ESEF spesso non riporta shares -> yfinance
+        if _is_eu_wacc and (_sh_b == 0.0 or _sh_b < 1e4):
+            _sh_yf2 = mkt.get("sharesOutstanding")
+            if _sh_yf2 and float(_sh_yf2) > 1e5:
+                _sh_b = float(_sh_yf2)
+
+        # Stub period automatico
+        _today = datetime.now()
+        _yr_end = datetime(_today.year,12,31)
+        _stub  = max((_yr_end-_today).days+1,0)/365.0
+        _base_yr = int(max(_rev_s.dropna().index)) if not _rev_s.dropna().empty else _today.year-1
+        if _base_yr < _today.year-1: _stub=1.0
+        elif _base_yr >= _today.year: _stub=0.0
+
+        # Growth defaults: [g1]*3 + [g1*0.65]*3
+        _g1_def = float(np.clip(rev_cagr_auto,0.03,0.30))
+        _g2_def = float(np.clip(_g1_def*0.65,0.02,0.15))
+
+        # ── Parametri interattivi ─────────────────────────────────────────
+        with st.expander("⚙️ Parametri DCF — modifica qui", expanded=False):
+            _c1,_c2,_c3 = st.columns(3)
+            with _c1:
+                dcf_wacc   = st.slider("WACC (%)",4.,20.,float(round(wacc_calc*100,2)),.25,key="dw")/100
+                dcf_term_g = st.slider("TGR %",0.5,4.5,2.5,.25,key="dtg")/100
+                dcf_years  = st.slider("Anni proiezione",5,10,6,1,key="dy")
+            with _c2:
+                dcf_ebit  = st.slider("EBIT Margin %",0.,50.,float(round(ebit_margin_def*100,1)),.5,key="de")/100
+                dcf_tax   = st.slider("Tax Rate %",10.,45.,float(round(tax_rate_dcf*100,1)),.5,key="dt")/100
+                dcf_da    = st.slider("D&A / Revenue %",0.,20.,float(round(da_pct_def*100,1)),.5,key="dda")/100
+            with _c3:
+                dcf_capex = st.slider("CapEx / Revenue %",0.,25.,float(round(capex_pct_def*100,1)),.5,key="dc")/100
+                dcf_nwc   = st.slider("NWC % di ΔRev",-5.,20.,float(round(nwc_pct_def*100,1)),.5,key="dnwc")/100
+                g1_sl     = st.slider("Rev Growth Y1-3 %",-5.,35.,float(round(_g1_def*100,1)),.5,key="dg1")
+            _cm,_ct = st.columns(2)
+            with _cm: mid_yr_on = st.checkbox("Mid-Year Convention",value=True,key="dmid")
+            with _ct: tv_exit_w = st.slider("Peso Exit Multiple TV %",0,50,20,5,key="dtev")/100
+            exit_ebitda_x = st.slider("Exit EV/EBITDA (x)",5.,25.,16.7,.1,key="devm")
+
+        # Growth schedule [g1]*3 + [g2]*3 come notebook
+        _g1=g1_sl/100; _g2=float(np.clip(_g1*0.65,dcf_term_g,_g1))
+        _gg = [_g1]*3+[_g2]*3
+        dcf_rev_growth = (_gg[:dcf_years] if dcf_years<=6
+                          else _gg+[_g2]*(dcf_years-6))
+
+        if not _rev_base or np.isnan(_rev_base):
+            st.warning("Revenue non disponibile.")
+        elif _sh_b<=0:
+            st.warning("Numero azioni non disponibile.")
+        else:
+            # ── Tabella storica (Cell 37 notebook) ───────────────────────
+            _all_yr = sorted(_rev_s.dropna().index)
+            if _all_yr:
+                def _fc(v,fmt="$B"):
+                    if pd.isna(v): return "—"
+                    if fmt=="$B": return f"{curr_sym}{v/1e9:.2f}B"
+                    if fmt=="%":  return f"{v*100:.1f}%"
+                    return str(round(v,2))
+                _htbl = {"Revenue":{yr:_fc(_rev_s.get(yr,np.nan),"$B") for yr in _all_yr}}
+                if not _ebit_s.dropna().empty:
+                    _htbl["EBIT"] = {yr:_fc(_ebit_s.get(yr,np.nan),"$B") for yr in _all_yr}
+                    _em_h=(_ebit_s/_rev_s.replace(0,np.nan)).dropna()
+                    _htbl["EBIT Margin"]={yr:_fc(_em_h.get(yr,np.nan),"%") for yr in _all_yr}
+                if not _da_s.dropna().empty:
+                    _htbl["D&A"]={yr:_fc(_da_s.get(yr,np.nan),"$B") for yr in _all_yr}
+                    _da_h=(_da_s/_rev_s.replace(0,np.nan)).dropna()
+                    _htbl["D&A % Rev"]={yr:_fc(_da_h.get(yr,np.nan),"%") for yr in _all_yr}
+                if not _cx_s.dropna().empty:
+                    _htbl["CapEx"]={yr:_fc(_cx_s.get(yr,np.nan),"$B") for yr in _all_yr}
+                    _cx_h=(_cx_s/_rev_s.replace(0,np.nan)).dropna()
+                    _htbl["CapEx % Rev"]={yr:_fc(_cx_h.get(yr,np.nan),"%") for yr in _all_yr}
+                with st.expander("📊 Base Storica — calibrazione assunzioni"):
+                    st.caption(f"Fonte: {data_source} | NWC: {_nwc_src}")
+                    _df_h = pd.DataFrame(_htbl).T
+                    _df_h.columns=[str(c) for c in _df_h.columns]
+                    st.dataframe(_df_h, use_container_width=True)
+
+            # ── Forecast (Cell 39 notebook — formula IDENTICA) ───────────
+            _rows=[]; _rv_t=_rev_base; _rv_p=_rev_base
+            _pv_tot=0.0; _disc_f=[]; _ebitda_f=[]; _ufcf_f=[]
+
+            for _i in range(dcf_years):
+                _gr  = dcf_rev_growth[_i] if _i<len(dcf_rev_growth) else dcf_term_g
+                _rv_t= _rv_p*(1+_gr); _drv=_rv_t-_rv_p
+                _ebit_t  = _rv_t*dcf_ebit
+                _nopat_t = _ebit_t*(1-dcf_tax)
+                _da_t    = _rv_t*dcf_da
+                _cx_t    = _rv_t*dcf_capex
+                # ΔNWC = DELTA_Revenue × nwc_pct  ← formula notebook (incrementale)
+                _dnwc_t  = _drv*dcf_nwc
+                _ufcf_t  = _nopat_t+_da_t-_cx_t-_dnwc_t
+                _ebitda_t= _ebit_t+_da_t
+
+                if mid_yr_on:
+                    if _i==0:
+                        _ufcf_t*=_stub; _disc_t=_stub/2.0 if _stub>0 else 0.5
+                    else:
+                        _disc_t=_stub+(_i-0.5)
+                else:
+                    _disc_t=float(_i+1)
+                _df_t=1.0/(1+dcf_wacc)**_disc_t; _pv_t=_ufcf_t*_df_t
+                _pv_tot+=_pv_t
+                _disc_f.append(_disc_t); _ebitda_f.append(_ebitda_t); _ufcf_f.append(_ufcf_t)
+                _rows.append({
+                    "Anno":_today.year+_i+1,"G%":round(_gr*100,1),
+                    f"Rev({curr_sym}M)":round(_rv_t/1e6,1),
+                    f"EBIT({curr_sym}M)":round(_ebit_t/1e6,1),"EBIT%":round(dcf_ebit*100,1),
+                    f"NOPAT({curr_sym}M)":round(_nopat_t/1e6,1),
+                    f"D&A({curr_sym}M)":round(_da_t/1e6,1),
+                    f"CapEx({curr_sym}M)":round(_cx_t/1e6,1),
+                    f"ΔNWC({curr_sym}M)":round(_dnwc_t/1e6,1),
+                    f"UFCF({curr_sym}M)":round(_ufcf_t/1e6,1),
+                    "DF":round(_df_t,4),f"PV({curr_sym}M)":round(_pv_t/1e6,1),
+                })
+                _rv_p=_rv_t
+
+            _disc_last=_disc_f[-1] if _disc_f else float(dcf_years)
+            _ebitda_last=_ebitda_f[-1] if _ebitda_f else np.nan
+            _ufcf_last=_ufcf_f[-1] if _ufcf_f else 0.0
+
+            _df_proj=pd.DataFrame(_rows).set_index("Anno")
+            with st.expander("📋 Forecast UFCF anno per anno"):
+                st.dataframe(_df_proj.style.format({"G%":"{:.1f}%","EBIT%":"{:.1f}%","DF":"{:.4f}",
+                    **{c:"{:,.1f}" for c in _df_proj.columns if c not in("G%","EBIT%","DF")}}),
                     use_container_width=True)
 
-            d4,d5,d6 = st.columns(3)
-            delta_pct = (price/intrinsic_price_dcf-1)*100 if price else 0
-            with d4: card("EV (DCF)",fmt_m(ev_dcf),ACCENT)
-            with d5: card("Prezzo Intrinseco DCF",f"${intrinsic_price_dcf:.2f}",
-                          GREEN if price<=intrinsic_price_dcf else RED)
-            with d6: card("vs Mercato",f"{delta_pct:+.1f}%",RED if delta_pct>0 else GREEN)
+            # ── Terminal Value + Equity Bridge (Cell 41) ─────────────────
+            if dcf_wacc>dcf_term_g:
+                _TV_p  = _ufcf_last*(1+dcf_term_g)/(dcf_wacc-dcf_term_g)
+                _PV_p  = _TV_p/(1+dcf_wacc)**_disc_last
+                _TV_e  = (_ebitda_last*exit_ebitda_x if not np.isnan(_ebitda_last) else _TV_p)
+                _PV_e  = _TV_e/(1+dcf_wacc)**_disc_last
+                _pw    = 1.0-tv_exit_w
+                _TV    = _pw*_TV_p+tv_exit_w*_TV_e
+                _PV_TV = _pw*_PV_p+tv_exit_w*_PV_e
+            else:
+                _TV=_PV_TV=0.0
+                st.error(f"WACC ({dcf_wacc*100:.1f}%) deve essere > TGR ({dcf_term_g*100:.1f}%)")
 
-            # Sensitivity heatmap
-            wacc_range = [dcf_wacc-0.02+i*0.01 for i in range(5)]
-            tg_range   = [dcf_term_g-0.01+i*0.005 for i in range(5)]
-            heat_data  = []
-            for w in wacc_range:
-                row_h=[]
-                for tg in tg_range:
-                    if w<=tg: row_h.append(np.nan); continue
-                    pv_h=sum(
-                        (rev_base*np.prod([1+g for g in (dcf_rev_growth[:t] or [dcf_term_g]*t)])
-                         *dcf_ebit*(1-dcf_tax)-rev_base*dcf_capex)/(1+w)**t
-                        for t in range(1,dcf_years+1))
-                    fcf_h=(rev_base*np.prod([1+g for g in dcf_rev_growth])*dcf_ebit*(1-dcf_tax)
-                           -rev_base*dcf_capex)
-                    tv_h=fcf_h*(1+tg)/(w-tg)
-                    ev_h=pv_h+tv_h/(1+w)**dcf_years
-                    row_h.append(float((ev_h-nd_dcf)/shares_dcf))
-                heat_data.append(row_h)
-            df_heat=pd.DataFrame(heat_data,
-                                 index=[f"{w*100:.1f}%" for w in wacc_range],
-                                 columns=[f"{tg*100:.1f}%" for tg in tg_range])
-            fig_heat=go.Figure(go.Heatmap(
-                z=df_heat.values,x=df_heat.columns.tolist(),y=df_heat.index.tolist(),
-                colorscale=[[0,"#f78166"],[.5,"#ffa657"],[1,"#3fb950"]],
-                text=[[f"${v:.0f}" if not pd.isna(v) else "N/A" for v in row] for row in df_heat.values],
-                texttemplate="%{text}",showscale=True))
-            if price:
-                fig_heat.add_annotation(text=f"Prezzo attuale: ${price:.2f}",
-                    xref="paper",yref="paper",x=.5,y=1.08,showarrow=False,
-                    font=dict(color=TEXT_C,size=11))
-            fig_heat.update_layout(**LAYOUT,height=380,
-                xaxis_title="Terminal Growth Rate",yaxis_title="WACC",
-                title="Sensitivity 1 — Prezzo Intrinseco (WACC × Terminal G)")
-            plo(fig_heat)
+            _EV   = _pv_tot+_PV_TV
+            _eq   = _EV+_cash_b-_debt_b
+            intrinsic_price_dcf = _eq/_sh_b
+            fair_values["DCF (UFCF)"] = intrinsic_price_dcf
+            _tv_pct = _PV_TV/_EV*100 if _EV>0 else np.nan
 
-            # ── Sensitivity 2: Revenue Growth × EBIT Margin ──────────────
+            # KPI
+            _k1,_k2,_k3,_k4=st.columns(4)
+            _delta=(price/intrinsic_price_dcf-1)*100 if price and intrinsic_price_dcf else 0
+            with _k1: card("EV (DCF)",fmt_m(_EV,sym=curr_sym),ACCENT)
+            with _k2: card("Equity Value",fmt_m(_eq,sym=curr_sym),PURPLE)
+            with _k3: card("Prezzo Intrinseco",f"{curr_sym}{intrinsic_price_dcf:.2f}",
+                           GREEN if price<=intrinsic_price_dcf else RED)
+            with _k4: card("vs Mercato",f"{_delta:+.1f}%",RED if _delta>0 else GREEN)
+
+            with st.expander("📊 Equity Bridge dettaglio"):
+                _br={
+                    "PV Flussi Espliciti":    f"{curr_sym}{_pv_tot/1e9:.2f}B",
+                    "TV Gordon Growth":        f"{curr_sym}{_TV_p/1e9:.2f}B",
+                    "TV Exit Multiple":        f"{curr_sym}{_TV_e/1e9:.2f}B  ({exit_ebitda_x:.1f}x EBITDA)",
+                    f"PV TV Blended ({_pw*100:.0f}%G/{tv_exit_w*100:.0f}%E)":
+                                               f"{curr_sym}{_PV_TV/1e9:.2f}B  ({_tv_pct:.1f}% EV)" if not np.isnan(_tv_pct) else "N/A",
+                    "Enterprise Value":        f"{curr_sym}{_EV/1e9:.2f}B",
+                    "+ Cash & ST Investments": f"{curr_sym}{_cash_b/1e9:.2f}B",
+                    "- Total Debt":            f"{curr_sym}{_debt_b/1e9:.2f}B",
+                    "= Equity Value":          f"{curr_sym}{_eq/1e9:.2f}B",
+                    "/ Diluted Shares":        f"{_sh_b/1e6:.1f}M",
+                    "→ Fair Value / Share":    f"{curr_sym}{intrinsic_price_dcf:.2f}",
+                }
+                for _bk,_bv in _br.items():
+                    st.markdown(f"**{_bk}**: `{_bv}`")
+
+            # ── 4 Grafici (replica Cell 42 notebook) ─────────────────────
             st.markdown("")
-            section("🔥","Sensitivity 2 — Rev Growth × EBIT Margin")
-            _rg_range = [dcf_rev_growth[0] - 0.04 + i * 0.02 for i in range(5)]
-            _em_range = [dcf_ebit - 0.04 + i * 0.02 for i in range(5)]
-            _heat2_data = []
-            for _rg in _rg_range:
-                _row_h2 = []
-                for _em in _em_range:
-                    if _rg <= -1 or _em <= 0:
-                        _row_h2.append(np.nan)
-                        continue
-                    _pv2 = 0.0
-                    _rv2 = rev_base
-                    _rv2_prev = rev_base
-                    for _t2 in range(1, dcf_years + 1):
-                        _gt2 = _rg * (1 - _t2 * 0.07) if _t2 <= len(dcf_rev_growth) else dcf_term_g
-                        _rv2 = _rv2_prev * (1 + _gt2)
-                        _np2 = _rv2 * _em * (1 - dcf_tax)
-                        _fcf2 = _np2 - _rv2 * dcf_capex
-                        _pv2 += _fcf2 / (1 + dcf_wacc) ** _t2
-                        _rv2_prev = _rv2
-                    if dcf_wacc > dcf_term_g:
-                        _fcf2_last = _rv2 * _em * (1 - dcf_tax) - _rv2 * dcf_capex
-                        _tv2 = _fcf2_last * (1 + dcf_term_g) / (dcf_wacc - dcf_term_g)
-                        _ev2 = _pv2 + _tv2 / (1 + dcf_wacc) ** dcf_years
-                    else:
-                        _ev2 = _pv2
-                    _row_h2.append(float((_ev2 - nd_dcf) / shares_dcf))
-                _heat2_data.append(_row_h2)
-            df_heat2 = pd.DataFrame(
-                _heat2_data,
-                index=[f"{_rg*100:.1f}%" for _rg in _rg_range],
-                columns=[f"{_em*100:.1f}%" for _em in _em_range])
-            fig_heat2 = go.Figure(go.Heatmap(
-                z=df_heat2.values,
-                x=df_heat2.columns.tolist(),
-                y=df_heat2.index.tolist(),
-                colorscale=[[0,"#f78166"],[.5,"#ffa657"],[1,"#3fb950"]],
-                text=[[f"${v:.0f}" if not pd.isna(v) else "N/A" for v in row] for row in df_heat2.values],
-                texttemplate="%{text}", showscale=True))
-            if price:
-                fig_heat2.add_annotation(
-                    text=f"Prezzo attuale: ${price:.2f}",
-                    xref="paper", yref="paper", x=.5, y=1.08, showarrow=False,
-                    font=dict(color=TEXT_C, size=11))
-            fig_heat2.update_layout(**LAYOUT, height=380,
-                xaxis_title="EBIT Margin",
-                yaxis_title="Rev Growth Anno 1",
-                title="Sensitivity 2 — Prezzo Intrinseco (Rev Growth × EBIT Margin)")
-            plo(fig_heat2)
+            _rev_hy=[yr for yr in sorted(_rev_s.dropna().index)]
+            _rev_hv=[_rev_s[yr]/1e9 for yr in _rev_hy]
+            _rev_fy=[_today.year+i+1 for i in range(dcf_years)]
+            _rv2=_rev_base
+            _rev_fv=[]
+            for _i2 in range(dcf_years):
+                _gr2=dcf_rev_growth[_i2] if _i2<len(dcf_rev_growth) else dcf_term_g
+                _rv2=_rv2*(1+_gr2); _rev_fv.append(_rv2/1e9)
+            _ufcf_m=[r[f"UFCF({curr_sym}M)"] for r in _rows]
+            _pv_m  =[r[f"PV({curr_sym}M)"] for r in _rows]
+            _yrs_r =[r["Anno"] for r in _rows]
 
-        # Altri metodi Fair Value
-        if shares and shares>0:
-            fcf_s=df_fund.get("free_cash_flow",pd.Series()).dropna()
-            if not fcf_s.empty:
-                fcf_base=float(fcf_s.iloc[-min(3,len(fcf_s)):].mean())
-                g_s=float(np.clip(rev_cagr_auto,0.01,0.20))
-                pv_ddm=sum(fcf_base*(1+g_s)**t/(1+wacc_calc)**t for t in range(1,6))
-                pv_ddm+=fcf_base*(1+g_s)**5*(1+0.03)/((wacc_calc-0.03)*(1+wacc_calc)**5)
-                fair_values["DDM/FCF"]=(pv_ddm-(nd_last or 0))/shares
-            ni_v=last_valid(df_fund.get("net_income",pd.Series()))
-            if ni_v and ni_v>0 and shares>0:
-                eps=ni_v/shares
-                fair_pe=min(max(rev_cagr_5y*100*2 if not pd.isna(rev_cagr_5y) else 20,12),35)
-                fair_values["P/E storico"]=eps*fair_pe
+            fig_dcf=make_subplots(rows=2,cols=2,subplot_titles=[
+                f"Revenue Storico + Forecast ({curr_sym}B)",
+                f"UFCF & PV(UFCF) ({curr_sym}M)",
+                f"Composizione EV ({curr_sym}B)",
+                "TV vs PV UFCF (%)",
+            ],specs=[[{"type":"xy"},{"type":"xy"}],
+                     [{"type":"xy"},{"type":"domain"}]])
+            fig_dcf.add_trace(go.Scatter(x=list(_rev_hy),y=_rev_hv,mode="lines+markers",
+                name="Storico",line=dict(color=ACCENT,width=2.5),marker=dict(size=7)),row=1,col=1)
+            fig_dcf.add_trace(go.Scatter(x=_rev_fy,y=_rev_fv,mode="lines+markers",
+                name="Forecast",line=dict(color=GREEN,width=2.5,dash="dash"),marker=dict(size=7)),row=1,col=1)
+            if _rev_hy:
+                fig_dcf.add_vline(x=_rev_hy[-1],line_dash="dot",line_color=MUTED,
+                                  line_width=1,row=1,col=1)
+            fig_dcf.add_trace(go.Bar(x=_yrs_r,y=_ufcf_m,name="UFCF",
+                marker_color=ACCENT,opacity=0.8),row=1,col=2)
+            fig_dcf.add_trace(go.Bar(x=_yrs_r,y=_pv_m,name="PV(UFCF)",
+                marker_color=GREEN,opacity=0.7),row=1,col=2)
+            _wf_v=[_pv_tot/1e9,_PV_TV/1e9,_EV/1e9]
+            _wf_l=["PV UFCF","PV TV","EV"]
+            fig_dcf.add_trace(go.Bar(x=_wf_l,y=_wf_v,name="EV Bridge",
+                marker_color=[ACCENT,PURPLE,ORANGE],opacity=0.85,
+                text=[f"{curr_sym}{v:.1f}B" for v in _wf_v],
+                textposition="outside"),row=2,col=1)
+            if _pv_tot>0 and _PV_TV>0:
+                fig_dcf.add_trace(go.Pie(
+                    labels=[f"PV UFCF\n{curr_sym}{_pv_tot/1e9:.1f}B",
+                            f"PV TV\n{curr_sym}{_PV_TV/1e9:.1f}B"],
+                    values=[_pv_tot,_PV_TV],marker_colors=[ACCENT,PURPLE],
+                    hole=0.4,showlegend=True),row=2,col=2)
+            fig_dcf.update_layout(**LAYOUT,height=680,
+                title=f"{company_name} — DCF Valuation Summary")
+            plo(fig_dcf)
 
-        fv_values={k:v for k,v in fair_values.items() if v and not pd.isna(v) and v>0}
-        if fv_values and price:
-            fv_med=float(np.median(list(fv_values.values())))
-            premium_disc=(price-fv_med)/fv_med
-            mos_pct=20; entry_price=fv_med*(1-mos_pct/100)
-            fig_fv=go.Figure()
-            for mk,fv_val in fv_values.items():
-                fig_fv.add_trace(go.Bar(name=mk,x=[mk],y=[fv_val],
-                                        marker_color=GREEN if price<=fv_val else RED,
-                                        opacity=.8,text=f"${fv_val:.2f}",textposition="outside"))
-            fig_fv.add_hline(y=price,line_color=ACCENT,line_dash="dash",
-                             annotation_text=f"Prezzo attuale ${price:.2f}",line_width=2)
-            fig_fv.add_hline(y=entry_price,line_color=ORANGE,line_dash="dot",
-                             annotation_text=f"Entry target ${entry_price:.2f} (MOS {mos_pct}%)",
-                             line_width=1.5)
-            fig_fv.update_layout(**LAYOUT,height=360,yaxis_title="Prezzo ($)",
-                                 title="Confronto Fair Value — Metodi multipli")
-            plo(fig_fv)
-            fv1,fv2,fv3=st.columns(3)
-            with fv1: card("Fair Value (mediana)",f"${fv_med:.2f}",GREEN)
-            with fv2: card("Prezzo attuale", f"${price:.2f}" if price else "N/A", ACCENT)
-            with fv3:
-                label_d="PREMIUM" if premium_disc>0 else "SCONTO"
-                card(label_d,f"{abs(premium_disc)*100:.1f}%",RED if premium_disc>0 else GREEN)
+            # ── Sensitivity WACC × TGR (Cell 44 notebook) ────────────────
+            st.markdown("")
+            section("🔥","Sensitivity — WACC × Terminal Growth Rate")
+
+            def _eng(w,tg,rb,gg,em,t,da,cx,nwc,n,sh,ca,db,st2=1.0,mid=False,ex=0.,pw=1.,ew=0.):
+                try:
+                    if w<=tg or pd.isna(rb) or rb==0: return np.nan
+                except: return np.nan
+                _p=0.;_rv=rb;_rp=rb;_el=np.nan
+                for _ii in range(n):
+                    _gr=gg[_ii] if _ii<len(gg) else gg[-1]
+                    _rv=_rp*(1+_gr);_dr=_rv-_rp
+                    _u=_rv*em*(1-t)+_rv*da-_rv*cx-_dr*nwc;_el=_rv*em+_rv*da
+                    if mid:
+                        _d=st2/2 if _ii==0 else st2+(_ii-0.5)
+                        if _ii==0:_u*=st2
+                    else: _d=float(_ii+1)
+                    _p+=_u/(1+w)**_d;_rp=_rv
+                _dT=st2+n-0.5 if mid else float(n)
+                _uT=_rv*em*(1-t)+_rv*da-_rv*cx
+                _tvp=_uT*(1+tg)/(w-tg);_tve=(_el*ex) if (ex>0 and not np.isnan(_el)) else 0
+                _tv=pw*_tvp+ew*_tve
+                return (_p+_tv/(1+w)**_dT+ca-db)/sh if sh>0 else np.nan
+
+            # Grid WACC: base-2% to base+3%, step 0.5% | TGR: 1%-4%, step 0.5%
+            _wg=np.arange(max(dcf_wacc-0.02,0.04),dcf_wacc+0.031,0.005)
+            _tg=np.arange(0.010,0.045,0.005)
+            _sm={}
+            for _tgv in _tg:
+                _row={}
+                for _wv in _wg:
+                    _row[round(_wv*100,1)]=_eng(_wv,_tgv,_rev_base,dcf_rev_growth,
+                        dcf_ebit,dcf_tax,dcf_da,dcf_capex,dcf_nwc,dcf_years,
+                        _sh_b,_cash_b,_debt_b,_stub,mid_yr_on,
+                        exit_ebitda_x,1-tv_exit_w,tv_exit_w)
+                _sm[round(_tgv*100,1)]=_row
+            _df_s=pd.DataFrame(_sm).T; _df_s.index.name="TGR\\WACC"
+
+            _zv=_df_s.values.tolist()
+            _zt=[[(v/price if (price and pd.notna(v)) else 0.5)
+                  for v in row] for row in _zv]
+            _ztxt=[[f"{curr_sym}{v:.0f}" if pd.notna(v) else "N/A"
+                    for v in row] for row in _zv]
+            fig_s1=go.Figure(go.Heatmap(
+                z=_zt,x=[f"{c:.1f}%" for c in _df_s.columns],
+                y=[f"{i:.1f}%" for i in _df_s.index],
+                colorscale=[[0,"#f78166"],[0.5,"#ffa657"],[0.9,"#3fb950"],[1,"#1a7f37"]],
+                text=_ztxt,texttemplate="%{text}",showscale=False,zmin=0.5,zmax=1.5))
+            fig_s1.add_annotation(
+                text=f"Base: WACC={dcf_wacc*100:.2f}% / TGR={dcf_term_g*100:.1f}% → {curr_sym}{intrinsic_price_dcf:.0f} | Prezzo: {curr_sym}{price:.0f}",
+                xref="paper",yref="paper",x=0.5,y=1.06,showarrow=False,
+                font=dict(color=TEXT_C,size=11))
+            fig_s1.update_layout(**LAYOUT,height=420,
+                xaxis_title="WACC",yaxis_title="Terminal Growth Rate",
+                title="Sensitivity 1 — Prezzo Implicito/Share (verde=upside, rosso=downside)")
+            plo(fig_s1)
+
+            # Sensitivity 2 — Rev Growth × EBIT Margin
+            st.markdown("")
+            section("🔥","Sensitivity 2 — Rev Growth Anno 1 × EBIT Margin")
+            _rg2=[max(_g1-0.04+i*0.02,-0.05) for i in range(5)]
+            _em2=[max(dcf_ebit-0.04+i*0.02,0.01) for i in range(5)]
+            _h2=[]
+            for _rg in _rg2:
+                _row2=[]
+                for _em in _em2:
+                    _gg2=[_rg]*3+[float(np.clip(_rg*0.65,dcf_term_g,_rg))]*max(dcf_years-3,0)
+                    _gg2=(_gg2[:dcf_years] if len(_gg2)>=dcf_years
+                          else _gg2+[_gg2[-1]]*(dcf_years-len(_gg2)))
+                    _row2.append(_eng(dcf_wacc,dcf_term_g,_rev_base,_gg2,
+                        _em,dcf_tax,dcf_da,dcf_capex,dcf_nwc,dcf_years,
+                        _sh_b,_cash_b,_debt_b,_stub,mid_yr_on,
+                        exit_ebitda_x,1-tv_exit_w,tv_exit_w))
+                _h2.append(_row2)
+            _df_h2=pd.DataFrame(_h2,index=[f"{g*100:.1f}%" for g in _rg2],
+                                 columns=[f"{e*100:.1f}%" for e in _em2])
+            _z2=_df_h2.values.tolist()
+            _zt2=[[(v/price if (price and pd.notna(v)) else 0.5)
+                   for v in row] for row in _z2]
+            _ztxt2=[[f"{curr_sym}{v:.0f}" if pd.notna(v) else "N/A"
+                     for v in row] for row in _z2]
+            fig_s2=go.Figure(go.Heatmap(
+                z=_zt2,x=_df_h2.columns.tolist(),y=_df_h2.index.tolist(),
+                colorscale=[[0,"#f78166"],[0.5,"#ffa657"],[0.9,"#3fb950"],[1,"#1a7f37"]],
+                text=_ztxt2,texttemplate="%{text}",showscale=False,zmin=0.5,zmax=1.5))
+            fig_s2.update_layout(**LAYOUT,height=380,
+                xaxis_title="EBIT Margin",yaxis_title="Rev Growth Anno 1",
+                title="Sensitivity 2 — Prezzo Implicito (Rev Growth × EBIT Margin)")
+            plo(fig_s2)
+
+        # ── FCFE Model ──────────────────────────────────────────────────────
+        st.markdown("")
+        section("💰","FCFE — Free Cash Flow to Equity")
+        _sh_fcfe = float(last_valid(df_fund.get("shares_outstanding",pd.Series(dtype=float))) or shares or 0)
+        _ni_fc   = last_valid(df_fund.get("net_income",pd.Series()))
+        _da_fc   = last_valid(df_fund.get("depreciation",pd.Series()))
+        _cx_fc   = last_valid(df_fund.get("capex",pd.Series()))
+        _rev_fc  = last_valid(df_fund.get("revenue",pd.Series()))
+        _debt_fc = last_valid(df_fund.get("total_debt",pd.Series())) or 0
+        _cash_fc = last_valid(df_fund.get("cash",pd.Series())) or 0
+
+        if _ni_fc and _sh_fcfe>0 and not np.isnan(_ni_fc):
+            _da_v  = abs(_da_fc) if not pd.isna(_da_fc or np.nan) else (_rev_fc or 0)*da_pct_def
+            _cx_v  = abs(_cx_fc) if not pd.isna(_cx_fc or np.nan) else (_rev_fc or 0)*capex_pct_def
+            _dnwc_v= (_rev_fc or 0)*rev_cagr_auto*nwc_pct_def
+            _fcfe0 = _ni_fc+_da_v-_cx_v-_dnwc_v+_debt_fc*0.04
+            _g1f=float(np.clip(rev_cagr_auto,0.01,0.25)); _g2f=dcf_term_g; _kef=ke_calc; _nf=6
+            if _kef>_g1f and _kef>_g2f:
+                _pvf=0.;_ft=_fcfe0
+                for _tf in range(1,_nf+1):
+                    _ft=_ft*(1+_g1f);_pvf+=_ft/(1+_kef)**_tf
+                _TVf=_ft*(1+_g2f)/(_kef-_g2f);_PVTVf=_TVf/(1+_kef)**_nf
+                _fcfe_px=(_pvf+_PVTVf+_cash_fc)/_sh_fcfe
+                fair_values["FCFE"]=_fcfe_px
+                _f1,_f2,_f3,_f4=st.columns(4)
+                _fups=(_fcfe_px/price-1)*100 if price else 0
+                with _f1: card("FCFE base",fmt_m(_fcfe0,sym=curr_sym),ACCENT)
+                with _f2: card("TV Gordon",fmt_m(_TVf,sym=curr_sym),PURPLE)
+                with _f3: card("Fair Value FCFE",f"{curr_sym}{_fcfe_px:.2f}",
+                               GREEN if price<=_fcfe_px else RED)
+                with _f4: card("Upside FCFE",f"{_fups:+.1f}%",GREEN if _fups>0 else RED)
+                with st.expander("ℹ️ Assunzioni FCFE"):
+                    st.markdown(f"""
+- **FCFE** = NI + D&A - CapEx - ΔNWC + Net Borrow = {curr_sym}{_fcfe0/1e6:.0f}M
+- **g1** = {_g1f*100:.1f}% · **g2** = {_g2f*100:.1f}% · **ke** = {_kef*100:.2f}% (CAPM)
+- **TV** = FCFE_n×(1+g2)/(ke-g2) = {curr_sym}{_TVf/1e9:.2f}B
+- **PV TV** = {curr_sym}{_PVTVf/1e9:.2f}B · **PV flussi** = {curr_sym}{_pvf/1e9:.2f}B
+""")
+            else:
+                st.info("FCFE non calcolabile: ke ≤ g.")
+        else:
+            st.info("Dati insufficienti per FCFE.")
+
+        # ── DDM a Due Stadi ─────────────────────────────────────────────────
+        st.markdown("")
+        section("💵","DDM a Due Stadi (replica DCF gg.xlsx)")
+        _sh_ddm = float(last_valid(df_fund.get("shares_outstanding",pd.Series(dtype=float))) or shares or 1)
+        _div0   = float(mkt.get("dividendPerShare") or mkt.get("dividendRate") or 0)
+        if _div0<=0 and price:
+            _dy_v=float(mkt.get("dividendYield") or 0)
+            if _dy_v>0: _div0=price*_dy_v
+        if _div0<=0:
+            _ni_ddm=last_valid(df_fund.get("net_income",pd.Series()))
+            if _ni_ddm and not np.isnan(_ni_ddm) and _sh_ddm>0:
+                _div0=_ni_ddm/_sh_ddm*0.40
+
+        if _div0>0 and ke_calc>0:
+            _roe_ddm=np.nan
+            if "net_income" in df_fund.columns and "total_equity" in df_fund.columns:
+                _ni_d=df_fund["net_income"].dropna();_eq_d=df_fund["total_equity"].dropna()
+                _ix_d=_ni_d.index.intersection(_eq_d.index)
+                if len(_ix_d)>0:
+                    _roe_ddm=float((_ni_d.reindex(_ix_d)/_eq_d.reindex(_ix_d).replace(0,np.nan)).iloc[-3:].mean())
+            _pay=float(np.clip(1-(_div0/max(
+                safe_div(last_valid(df_fund.get("net_income",pd.Series())),_sh_ddm) or _div0,0.01)),0.10,0.95))
+            _g1d=float(np.clip((_roe_ddm or 0.12)*(1-_pay),0.02,0.20))
+            _g2d=float(np.clip(dcf_term_g,0.01,ke_calc-0.01))
+            _nd=6
+            if ke_calc>_g1d and ke_calc>_g2d:
+                _pvd=0.;_dt=_div0
+                for _td in range(1,_nd+1):
+                    _dt=_dt*(1+_g1d);_pvd+=_dt/(1+ke_calc)**_td
+                _TVd=_dt*(1+_g2d)/(ke_calc-_g2d);_PVTVd=_TVd/(1+ke_calc)**_nd
+                _ddm_px=_pvd+_PVTVd
+                fair_values["DDM 2-stage"]=_ddm_px
+                _dd1,_dd2,_dd3,_dd4=st.columns(4)
+                _ddm_ups=(_ddm_px/price-1)*100 if price else 0
+                with _dd1: card("D0/Share",f"{curr_sym}{_div0:.2f}",ACCENT)
+                with _dd2: card("g1 / g2",f"{_g1d*100:.1f}% / {_g2d*100:.1f}%",ORANGE)
+                with _dd3: card("Fair Value DDM",f"{curr_sym}{_ddm_px:.2f}",
+                               GREEN if price<=_ddm_px else RED)
+                with _dd4: card("Upside DDM",f"{_ddm_ups:+.1f}%",GREEN if _ddm_ups>0 else RED)
+                with st.expander("ℹ️ Assunzioni DDM"):
+                    st.markdown(f"""
+- **D0** = {curr_sym}{_div0:.2f} · ROE = {(_roe_ddm or 0)*100:.1f}% · payout = {_pay*100:.0f}%
+- **g1** = {_g1d*100:.1f}% (ROE×retention) · **g2** = {_g2d*100:.1f}% · ke = {ke_calc*100:.2f}%
+- **TV** = D_n×(1+g2)/(ke-g2) = {curr_sym}{_TVd:.2f}/share
+- **PV div S1** = {curr_sym}{_pvd:.2f} · **PV TV** = {curr_sym}{_PVTVd:.2f}
+""")
+            else:
+                st.info("DDM non calcolabile: ke ≤ g.")
+        else:
+            st.info("Nessun dividendo — DDM non applicabile.")
+
+        # ── P/E fair value ─────────────────────────────────────────────────
+        _ni_pe=last_valid(df_fund.get("net_income",pd.Series()))
+        _sh_pe=float(last_valid(df_fund.get("shares_outstanding",pd.Series(dtype=float))) or shares or 0)
+        if _ni_pe and _ni_pe>0 and _sh_pe>0:
+            _eps_pe=_ni_pe/_sh_pe
+            _fpe=min(max(rev_cagr_5y*100*2 if not pd.isna(rev_cagr_5y) else 20,12),35)
+            fair_values["P/E storico"]=_eps_pe*_fpe
+
+        # ── Grafico tutti i metodi ─────────────────────────────────────────
+        _fvall={k:v for k,v in fair_values.items() if v and not pd.isna(v) and v>0}
+        if _fvall and price:
+            _fvmed=float(np.median(list(_fvall.values())))
+            _prem=(price-_fvmed)/_fvmed; _entry=_fvmed*0.80
+            st.markdown("")
+            section("⚖️","Confronto Fair Value — Tutti i Metodi")
+            _figfv=go.Figure()
+            for _mk,_fvv in _fvall.items():
+                _figfv.add_trace(go.Bar(name=_mk,x=[_mk],y=[_fvv],
+                    marker_color=GREEN if price<=_fvv else RED,opacity=.85,
+                    text=f"{curr_sym}{_fvv:.0f}",textposition="outside"))
+            _figfv.add_hline(y=price,line_color=ACCENT,line_dash="dash",
+                             annotation_text=f"Prezzo {curr_sym}{price:.2f}",line_width=2)
+            _figfv.add_hline(y=_entry,line_color=ORANGE,line_dash="dot",
+                             annotation_text=f"MOS 20% {curr_sym}{_entry:.2f}",line_width=1.5)
+            _figfv.update_layout(**LAYOUT,height=420,yaxis_title=f"Fair Value ({curr_sym})",
+                                 title="Fair Value — Confronto Multi-Metodo")
+            plo(_figfv)
+            _fv1,_fv2,_fv3=st.columns(3)
+            with _fv1: card("Fair Value mediana",f"{curr_sym}{_fvmed:.2f}",GREEN)
+            with _fv2: card("Prezzo",f"{curr_sym}{price:.2f}",ACCENT)
+            with _fv3:
+                _lp="PREMIUM" if _prem>0 else "SCONTO"
+                card(_lp,f"{abs(_prem)*100:.1f}%",RED if _prem>0 else GREEN)
     else:
         st.info("Prezzo non disponibile per il calcolo DCF.")
 
@@ -2258,13 +2995,13 @@ with tab8:
         _up_wfv   = ((_wfv_sc2 - price) / price) if price and not np.isnan(_wfv_sc2 or np.nan) else np.nan
         _sc_kpi1, _sc_kpi2, _sc_kpi3, _sc_kpi4, _sc_kpi5 = st.columns(5)
         with _sc_kpi1:
-            card("Bear (25%)", f"${_bear_fv:.2f}" if not np.isnan(_bear_fv or np.nan) else "N/D", RED)
+            card("Bear (25%)", f"{curr_sym}{_bear_fv:.2f}" if not np.isnan(_bear_fv or np.nan) else "N/D", RED)
         with _sc_kpi2:
-            card("Base (50%)", f"${_base_fv:.2f}" if not np.isnan(_base_fv or np.nan) else "N/D", ORANGE)
+            card("Base (50%)", f"{curr_sym}{_base_fv:.2f}" if not np.isnan(_base_fv or np.nan) else "N/D", ORANGE)
         with _sc_kpi3:
-            card("Bull (25%)", f"${_bull_fv:.2f}" if not np.isnan(_bull_fv or np.nan) else "N/D", GREEN)
+            card("Bull (25%)", f"{curr_sym}{_bull_fv:.2f}" if not np.isnan(_bull_fv or np.nan) else "N/D", GREEN)
         with _sc_kpi4:
-            card("Weighted Avg FV", f"${_wfv_sc2:.2f}" if not np.isnan(_wfv_sc2 or np.nan) else "N/D",
+            card("Weighted Avg FV", f"{curr_sym}{_wfv_sc2:.2f}" if not np.isnan(_wfv_sc2 or np.nan) else "N/D",
                  GREEN if not np.isnan(_up_wfv or np.nan) and (_up_wfv or 0) > 0 else RED)
         with _sc_kpi5:
             card("Upside (Weighted)", f"{_up_wfv*100:+.1f}%" if not np.isnan(_up_wfv or np.nan) else "N/D",
@@ -2277,7 +3014,7 @@ with tab8:
         for _sn3, _sv3 in scenario_results.items():
             _fv3 = _sv3.get("fair_value", np.nan)
             _up3 = ((_fv3 - price) / price) if price and not np.isnan(_fv3 or np.nan) else np.nan
-            # Estimate FCF Y1 for display (Rev_base × (1+g) × EBIT × (1-T) − CapEx)
+            # Estimate FCF Y1 for display (Rev_base × (1+g) × EBIT × (1-T) - CapEx)
             _sc_g3  = _scens.get(_sn3, {}).get("g", 0) if "_scens" in dir() and _sn3 in ("Bear","Base","Bull") else np.nan
             _sc_mg3 = _scens.get(_sn3, {}).get("mg", 0) if "_scens" in dir() and _sn3 in ("Bear","Base","Bull") else np.nan
             if not np.isnan(_sc_g3) and _rev_base_sc_disp > 0:
@@ -2411,8 +3148,8 @@ with tab9:
     section("🌟","Valore Intrinseco Finale — Multi-Model Blend")
     if blend_price and not np.isnan(blend_price):
         mm1,mm2,mm3,mm4 = st.columns(4)
-        with mm1: card("Blend Price", f"${blend_price:.2f}", GREEN if (upside_mm or 0) > 0 else RED)
-        with mm2: card("Prezzo Attuale", f"${price:.2f}" if price else "N/A", ACCENT)
+        with mm1: card("Blend Price", f"{curr_sym}{blend_price:.2f}", GREEN if (upside_mm or 0) > 0 else RED)
+        with mm2: card("Prezzo Attuale", f"{curr_sym}{price:.2f}" if price else "N/A", ACCENT)
         with mm3: card("Upside/Downside", f"{(upside_mm or 0)*100:+.1f}%",
                        GREEN if (upside_mm or 0) > 0.05 else RED if (upside_mm or 0) < -0.05 else ORANGE)
         with mm4: card("Confidenza", mm_confidence,
@@ -2504,8 +3241,8 @@ with tab9:
                            "**Bank**: Multipli P/E (35%) + P/BV (30%) + RIM (20%) + DDM (15%) — DCF FCFF escluso")
             st.markdown(_method_txt)
             st.markdown(f"""
-- **RIM** = BVPS + (EPS − WACC×BVPS) / (WACC − TGR)  →  {'$'+f'{rim_fv:.2f}' if not np.isnan(rim_fv) else 'N/A'}
-- **DDM** = D₀×(1+g) / (WACC−g)  →  {'$'+f'{ddm_fv:.2f}' if not np.isnan(ddm_fv) else 'N/A'}
+- **RIM** = BVPS + (EPS - WACC×BVPS) / (WACC - TGR)  →  {'$'+f'{rim_fv:.2f}' if not np.isnan(rim_fv) else 'N/A'}
+- **DDM** = D₀×(1+g) / (WACC-g)  →  {'$'+f'{ddm_fv:.2f}' if not np.isnan(ddm_fv) else 'N/A'}
 - **BVPS** = {f'${bvps_last:.2f}' if (bvps_last is not None and not np.isnan(float(bvps_last))) else 'N/A'}
 - **WACC usato** = {wacc_calc*100:.2f}%
 """)
@@ -2716,6 +3453,53 @@ with tab11:
         elif hl_all:
             for h in hl_all[:5]: st.markdown(f"- {h[:110]}")
 
+# ═══════════════════════════════════════════════════════════════
+# MULTI-MODEL BLEND — recomputed after Tab 6 populates fair_values
+# ═══════════════════════════════════════════════════════════════
+_all_mv2 = {}
+# From Tab 6 fair_values (DCF UFCF, FCFE, DDM 2-stage, P/E storico)
+for _k, _v in fair_values.items():
+    if _v and not np.isnan(_v) and _v > 0:
+        _w_mv2 = 0.40 if "DCF" in _k else (0.15 if "FCFE" in _k else
+                  0.10 if "DDM" in _k else 0.05)
+        if is_bank and "DCF" in _k:
+            continue  # skip DCF for banks
+        _all_mv2[_k] = (_v, _w_mv2)
+# Add scenario, multiples, RIM
+if not is_bank:
+    if not np.isnan(_sc_wfv2 or np.nan) and (_sc_wfv2 or 0) > 0:
+        _all_mv2["Scenario"] = (_sc_wfv2, 0.15)
+    if not np.isnan(_mult_fv2 or np.nan) and (_mult_fv2 or 0) > 0:
+        _all_mv2["Multipli Peer"] = (_mult_fv2, 0.25)
+    if not np.isnan(rim_fv or np.nan) and (rim_fv or 0) > 0:
+        _all_mv2["RIM"] = (rim_fv, 0.10)
+else:
+    if not np.isnan(_mult_fv2 or np.nan) and (_mult_fv2 or 0) > 0:
+        _all_mv2["Multipli P/E"] = (_mult_fv2, 0.35)
+    if not np.isnan(bvps_last or np.nan) and (bvps_last or 0) > 0:
+        _pbv_mm2 = valuation.get("P/B")
+        if _pbv_mm2 and not np.isnan(_pbv_mm2):
+            _all_mv2["P/BV Peer"] = (bvps_last * _pbv_mm2, 0.30)
+    if not np.isnan(rim_fv or np.nan) and (rim_fv or 0) > 0:
+        _all_mv2["RIM"] = (rim_fv, 0.20)
+    if not np.isnan(ddm_fv or np.nan) and (ddm_fv or 0) > 0 and "DDM 2-stage" not in _all_mv2:
+        _all_mv2["DDM (Gordon)"] = (ddm_fv, 0.15)
+
+_tw2 = sum(w for _, w in _all_mv2.values()) or 1
+_norm_mv2  = {k: (v, w / _tw2) for k, (v, w) in _all_mv2.items()}
+blend_price = sum(v * w for v, w in _norm_mv2.values()) if _norm_mv2 else np.nan
+_valid_fvs2 = [v for v, _ in _norm_mv2.values()]
+iv_low      = min(_valid_fvs2) if _valid_fvs2 else np.nan
+iv_high     = max(_valid_fvs2) if _valid_fvs2 else np.nan
+iv_cv       = (float(np.std(_valid_fvs2)) / blend_price * 100
+               if len(_valid_fvs2) > 1 and not np.isnan(blend_price or np.nan) and blend_price > 0
+               else np.nan)
+mm_confidence = ("ALTA" if not np.isnan(iv_cv) and iv_cv < 15
+                 else "MEDIA" if not np.isnan(iv_cv) and iv_cv < 30
+                 else "BASSA")
+upside_mm = ((blend_price - price) / price) if price and not np.isnan(blend_price or np.nan) else np.nan
+premium_disc = (price - blend_price) / blend_price if blend_price and blend_price > 0 and price else premium_disc
+
 # ──────────────────────────────────────────────────────────────
 # TAB 12 — VERDETTO (ex tab8)
 # ──────────────────────────────────────────────────────────────
@@ -2895,11 +3679,11 @@ with tab12:
       <h2 style="margin:0">{v_em} {verdict}</h2>
       <p style="margin:8px 0 0 0;color:#8b949e">
         Score: <strong>{final_score:.0f}/100</strong>
-        &nbsp;|&nbsp; Fair Value (blend): <strong>{"$"+f"{fv_med_t:.2f}" if fv_med_t else "N/A"}</strong>
-        &nbsp;|&nbsp; Prezzo: <strong>{"$"+f"{price:.2f}" if price else "N/A"}</strong>
+        &nbsp;|&nbsp; Fair Value (blend): <strong>{curr_sym+f"{fv_med_t:.2f}" if fv_med_t else "N/A"}</strong>
+        &nbsp;|&nbsp; Prezzo: <strong>{curr_sym+f"{price:.2f}" if price else "N/A"}</strong>
         &nbsp;|&nbsp; Upside: <strong style="color:{'#3fb950' if (upside_mm or 0)>0 else '#f78166'}">{"N/A" if np.isnan(upside_mm or np.nan) else f"{upside_mm*100:+.1f}%"}</strong>
       </p>
-      {"<p style='margin:4px 0 0 0'>Entry target (MOS 20%): <strong>$"+f"{entry_t:.2f}"+"</strong></p>" if entry_t else ""}
+      {"<p style='margin:4px 0 0 0'>Entry target (MOS 20%): <strong>"+curr_sym+f"{entry_t:.2f}"+"</strong></p>" if entry_t else ""}
     </div>""", unsafe_allow_html=True)
     st.markdown("")
 
@@ -2990,10 +3774,10 @@ with tab12:
         "",
         f"VERDETTO: {v_em} {verdict}",
         f"Score: {final_score:.0f}/100",
-        f"Fair Value (blend): {'$'+f'{fv_med_t:.2f}' if fv_med_t else 'N/A'}",
-        f"Prezzo attuale: {'$'+f'{price:.2f}' if price else 'N/A'}",
+        f"Fair Value (blend): {curr_sym+f'{fv_med_t:.2f}' if fv_med_t else 'N/A'}",
+        f"Prezzo attuale: {curr_sym+f'{price:.2f}' if price else 'N/A'}",
         f"Upside/Downside: {upside_mm*100:+.1f}%" if not np.isnan(upside_mm or np.nan) else "Upside: N/A",
-        f"Entry target (MOS 20%): {'$'+f'{entry_t:.2f}' if entry_t else 'N/A'}",
+        f"Entry target (MOS 20%): {curr_sym+f'{entry_t:.2f}' if entry_t else 'N/A'}",
         "",
         f"{'─'*70}",
         "SCORING 8 DIMENSIONI",
